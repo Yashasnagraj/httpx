@@ -113,7 +113,10 @@ class ASGITransport(AsyncBaseTransport):
             "path": request.url.path,
             "raw_path": request.url.raw_path.split(b"?")[0],
             "query_string": request.url.query,
-            "server": (request.url.host, request.url.port),
+            "server": (
+                request.url.host,
+                request.url.port or {"http": 80, "https": 443}.get(request.url.scheme),
+            ),
             "client": self.client,
             "root_path": self.root_path,
         }
@@ -168,7 +171,7 @@ class ASGITransport(AsyncBaseTransport):
 
         try:
             await self.app(scope, receive, send)
-        except Exception:  # noqa: PIE-786
+        except Exception:
             if self.raise_app_exceptions:
                 raise
 
@@ -178,9 +181,22 @@ class ASGITransport(AsyncBaseTransport):
             if response_headers is None:
                 response_headers = {}
 
-        assert response_complete.is_set()
-        assert status_code is not None
-        assert response_headers is not None
+        if (
+            not response_complete.is_set()
+            or status_code is None
+            or response_headers is None
+        ):
+            # The app returned without sending a complete response.
+            if self.raise_app_exceptions:
+                raise RuntimeError(
+                    "ASGI app did not send a complete response. Expected an "
+                    "'http.response.start' message followed by one or more "
+                    "'http.response.body' messages ending with 'more_body': False."
+                )
+            response_complete.set()
+            status_code = 500
+            response_headers = {}
+            body_parts = []
 
         stream = ASGIResponseStream(body_parts)
 

@@ -421,6 +421,8 @@ async def test_digest_auth_401_response_without_digest_auth_header() -> None:
         ("SHA-256-SESS", 64, 64),
         ("SHA-512", 64, 128),
         ("SHA-512-SESS", 64, 128),
+        ("SHA-512-256", 64, 64),
+        ("SHA-512-256-SESS", 64, 64),
     ],
 )
 @pytest.mark.anyio
@@ -454,6 +456,73 @@ async def test_digest_auth(
     assert digest_data["qop"] == "auth"
     assert digest_data["nc"] == "00000001"
     assert len(digest_data["cnonce"]) == 16 + 2
+
+
+@pytest.mark.anyio
+async def test_digest_auth_unsupported_algorithm() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(algorithm="SHA-3-512")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError, match="Unsupported Digest algorithm"):
+            await client.get(url, auth=auth)
+
+
+@pytest.mark.anyio
+async def test_digest_auth_with_multiple_challenges() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = (
+        'Basic realm="example", '
+        'Digest realm="httpx@example.org", qop="auth", nonce="abc", opaque="xyz"'
+    )
+
+    def app(request: httpx.Request) -> httpx.Response:
+        if "Authorization" not in request.headers:
+            return httpx.Response(401, headers={"www-authenticate": auth_header})
+        return httpx.Response(200, json={"auth": request.headers["Authorization"]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+    authorization = typing.cast(typing.Dict[str, typing.Any], response.json())["auth"]
+    assert authorization.startswith("Digest ")
+    assert 'realm="httpx@example.org"' in authorization
+
+
+@pytest.mark.anyio
+async def test_digest_auth_does_not_reuse_challenge_across_hosts() -> None:
+    """
+    A Digest challenge is bound to the origin that issued it, so it must not
+    be sent pre-emptively to a different host.
+    """
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+    seen: typing.List[typing.Optional[str]] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Authorization"))
+        return app(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(record), auth=auth
+    ) as client:
+        response_1 = await client.get("https://a.example.org/")
+        response_2 = await client.get("https://b.example.org/")
+        response_3 = await client.get("https://a.example.org/")
+
+    assert response_1.status_code == 200
+    assert len(response_1.history) == 1
+    # The first request to the second host is sent without credentials.
+    assert response_2.status_code == 200
+    assert seen[2] is None
+    # ... while the first host keeps reusing its cached challenge.
+    assert response_3.status_code == 200
+    assert len(response_3.history) == 0
+    assert seen[-1] is not None and seen[-1].startswith("Digest ")
 
 
 @pytest.mark.anyio

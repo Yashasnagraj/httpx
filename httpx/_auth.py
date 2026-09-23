@@ -172,8 +172,12 @@ class NetRCAuth(Auth):
         return f"Basic {token}"
 
 
-class DigestAuth(Auth):
-    _ALGORITHM_TO_HASH_FUNCTION: dict[str, typing.Callable[[bytes], _Hash]] = {
+def _sha512_256(data: bytes) -> _Hash:
+    return hashlib.new("sha512_256", data)
+
+
+def _digest_hash_functions() -> dict[str, typing.Callable[[bytes], _Hash]]:
+    hash_functions: dict[str, typing.Callable[[bytes], _Hash]] = {
         "MD5": hashlib.md5,
         "MD5-SESS": hashlib.md5,
         "SHA": hashlib.sha1,
@@ -183,17 +187,45 @@ class DigestAuth(Auth):
         "SHA-512": hashlib.sha512,
         "SHA-512-SESS": hashlib.sha512,
     }
+    try:
+        # SHA-512/256 (RFC 7616) has no dedicated `hashlib` constructor and not
+        # every OpenSSL build provides it, so only register it when available.
+        hashlib.new("sha512_256")
+    except ValueError:  # pragma: no cover
+        return hash_functions
+    hash_functions["SHA-512-256"] = _sha512_256
+    hash_functions["SHA-512-256-SESS"] = _sha512_256
+    return hash_functions
+
+
+# Locates a "Digest" challenge, which may be the first challenge in a
+# `WWW-Authenticate` header or follow another challenge after a comma:
+#     `Basic realm="r", Digest realm="r", nonce="n"`
+_DIGEST_CHALLENGE_RE = re.compile(r"(?:^|,\s*)digest\s+", re.IGNORECASE)
+
+# The origin a Digest challenge was issued by, as `(scheme, host, port)`.
+_Origin = typing.Tuple[str, str, typing.Optional[int]]
+
+
+class DigestAuth(Auth):
+    _ALGORITHM_TO_HASH_FUNCTION: dict[str, typing.Callable[[bytes], _Hash]] = (
+        _digest_hash_functions()
+    )
 
     def __init__(self, username: str | bytes, password: str | bytes) -> None:
         self._username = to_bytes(username)
         self._password = to_bytes(password)
-        self._last_challenge: _DigestAuthChallenge | None = None
-        self._nonce_count = 1
+        # Challenges are cached per origin, so that a realm and nonce issued by
+        # one server are never sent pre-emptively to a different one.
+        self._challenges: dict[_Origin, _DigestAuthChallenge] = {}
+        self._nonce_counts: dict[_Origin, int] = {}
 
     def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
-        if self._last_challenge:
+        origin = self._get_origin(request)
+        challenge = self._challenges.get(origin)
+        if challenge is not None:
             request.headers["Authorization"] = self._build_auth_header(
-                request, self._last_challenge
+                request, challenge
             )
 
         response = yield request
@@ -204,40 +236,43 @@ class DigestAuth(Auth):
             return
 
         for auth_header in response.headers.get_list("www-authenticate"):
-            if auth_header.lower().startswith("digest "):
+            match = _DIGEST_CHALLENGE_RE.search(auth_header)
+            if match is not None:
+                fields = auth_header[match.end() :]
                 break
         else:
             # If the response does not include a 'WWW-Authenticate: Digest ...'
             # header, then we don't need to build an authenticated request.
             return
 
-        self._last_challenge = self._parse_challenge(request, response, auth_header)
-        self._nonce_count = 1
+        challenge = self._parse_challenge(request, response, fields)
+        self._challenges[origin] = challenge
+        self._nonce_counts[origin] = 1
 
-        request.headers["Authorization"] = self._build_auth_header(
-            request, self._last_challenge
-        )
+        request.headers["Authorization"] = self._build_auth_header(request, challenge)
         if response.cookies:
             Cookies(response.cookies).set_cookie_header(request=request)
         yield request
 
+    def _get_origin(self, request: Request) -> _Origin:
+        return (request.url.scheme, request.url.host, request.url.port)
+
     def _parse_challenge(
-        self, request: Request, response: Response, auth_header: str
+        self, request: Request, response: Response, fields: str
     ) -> _DigestAuthChallenge:
         """
-        Returns a challenge from a Digest WWW-Authenticate header.
+        Returns a challenge from the fields of a Digest WWW-Authenticate header.
         These take the form of:
-        `Digest realm="realm@host.com",qop="auth,auth-int",nonce="abc",opaque="xyz"`
+        `realm="realm@host.com",qop="auth,auth-int",nonce="abc",opaque="xyz"`
         """
-        scheme, _, fields = auth_header.partition(" ")
-
-        # This method should only ever have been called with a Digest auth header.
-        assert scheme.lower() == "digest"
-
         header_dict: dict[str, str] = {}
         for field in parse_http_list(fields):
-            key, value = field.strip().split("=", 1)
-            header_dict[key] = unquote(value)
+            key, sep, value = field.strip().partition("=")
+            if not sep:
+                message = "Malformed Digest WWW-Authenticate header"
+                raise ProtocolError(message, request=request)
+            # Parameter names are case-insensitive (RFC 7616, Section 3.3).
+            header_dict[key.strip().lower()] = unquote(value.strip())
 
         try:
             realm = header_dict["realm"].encode()
@@ -255,7 +290,13 @@ class DigestAuth(Auth):
     def _build_auth_header(
         self, request: Request, challenge: _DigestAuthChallenge
     ) -> str:
-        hash_func = self._ALGORITHM_TO_HASH_FUNCTION[challenge.algorithm.upper()]
+        hash_func = self._ALGORITHM_TO_HASH_FUNCTION.get(challenge.algorithm.upper())
+        if hash_func is None:
+            message = (
+                f"Unsupported Digest algorithm {challenge.algorithm!r}. "
+                f"Supported algorithms: {', '.join(self._ALGORITHM_TO_HASH_FUNCTION)}"
+            )
+            raise ProtocolError(message, request=request)
 
         def digest(data: bytes) -> bytes:
             return hash_func(data).hexdigest().encode()
@@ -267,9 +308,11 @@ class DigestAuth(Auth):
         # TODO: implement auth-int
         HA2 = digest(A2)
 
-        nc_value = b"%08x" % self._nonce_count
-        cnonce = self._get_client_nonce(self._nonce_count, challenge.nonce)
-        self._nonce_count += 1
+        origin = self._get_origin(request)
+        nonce_count = self._nonce_counts.get(origin, 1)
+        nc_value = b"%08x" % nonce_count
+        cnonce = self._get_client_nonce(nonce_count, challenge.nonce)
+        self._nonce_counts[origin] = nonce_count + 1
 
         HA1 = digest(A1)
         if challenge.algorithm.lower().endswith("-sess"):
@@ -317,12 +360,12 @@ class DigestAuth(Auth):
         for i, (field, value) in enumerate(header_fields.items()):
             if i > 0:
                 header_value += ", "
-            template = (
-                QUOTED_TEMPLATE
-                if field not in NON_QUOTED_FIELDS
-                else NON_QUOTED_TEMPLATE
-            )
-            header_value += template.format(field, to_str(value))
+            if field in NON_QUOTED_FIELDS:
+                header_value += NON_QUOTED_TEMPLATE.format(field, to_str(value))
+            else:
+                # Quoted-string values must escape backslashes and double quotes.
+                escaped = to_str(value).replace("\\", "\\\\").replace('"', '\\"')
+                header_value += QUOTED_TEMPLATE.format(field, escaped)
 
         return header_value
 

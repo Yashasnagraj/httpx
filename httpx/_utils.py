@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import stat
 import typing
 from urllib.request import getproxies
 
@@ -62,16 +63,30 @@ def get_environment_proxies() -> dict[str, str | None]:
             #   (But not "wwwgoogle.com")
             # NO_PROXY can include domains, IPv6, IPv4 addresses and "localhost"
             #   NO_PROXY=example.com,::1,localhost,192.168.0.0/16
+            # CIDR ranges such as "10.0.0.0/8" or "fd00::/8" are supported by
+            #   `URLPattern`, which matches any address within the network.
             if "://" in hostname:
                 mounts[hostname] = None
+            elif hostname.startswith("["):
+                # Bracketed IPv6, optionally with a port: "[::1]" or "[::1]:8080".
+                # The brackets are already present, so pass the entry through
+                # unchanged rather than wrapping it in a second pair.
+                mounts[f"all://{hostname}"] = None
             elif is_ipv4_hostname(hostname):
                 mounts[f"all://{hostname}"] = None
             elif is_ipv6_hostname(hostname):
-                mounts[f"all://[{hostname}]"] = None
+                # An IPv6 address must be bracketed to be a valid URL host, and
+                # any CIDR prefix ("fd00::/8") has to sit outside the brackets.
+                address, slash, prefix = hostname.partition("/")
+                mounts[f"all://[{address}]{slash}{prefix}"] = None
             elif hostname.lower() == "localhost":
                 mounts[f"all://{hostname}"] = None
             else:
-                mounts[f"all://*{hostname}"] = None
+                # NO_PROXY=*.google.com is equivalent to NO_PROXY=.google.com,
+                #   so drop any leading "*" before we add our own wildcard.
+                hostname = hostname.lstrip("*")
+                if hostname:
+                    mounts[f"all://*{hostname}"] = None
 
     return mounts
 
@@ -89,30 +104,57 @@ def to_bytes_or_str(value: str, match_type_of: typing.AnyStr) -> typing.AnyStr:
 
 
 def unquote(value: str) -> str:
-    return value[1:-1] if value[0] == value[-1] == '"' else value
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1]
+    return value
 
 
-def peek_filelike_length(stream: typing.Any) -> int | None:
+def peek_filelike_length(
+    stream: typing.Any, *, from_current_position: bool = False
+) -> int | None:
     """
     Given a file-like stream object, return its length in number of bytes
     without reading it into memory.
+
+    By default this is the total size of the stream. When `from_current_position`
+    is set, the bytes before the stream's current position are excluded, so the
+    result is the number of bytes that a `.read()` from here would return.
+
+    Returns `None` if the length cannot be determined, in which case callers
+    should fall back to chunked transfer encoding.
     """
     try:
         # Is it an actual file?
         fd = stream.fileno()
         # Yup, seems to be an actual file.
-        length = os.fstat(fd).st_size
+        st = os.fstat(fd)
     except (AttributeError, OSError):
         # No... Maybe it's something that supports random access, like `io.BytesIO`?
         try:
             # Assuming so, go to end of stream to figure out its length,
             # then put it back in place.
             offset = stream.tell()
-            length = stream.seek(0, os.SEEK_END)
+            length: int = stream.seek(0, os.SEEK_END)
             stream.seek(offset)
         except (AttributeError, OSError):
             # Not even that? Sorry, we're doomed...
             return None
+    else:
+        if not stat.S_ISREG(st.st_mode):
+            # `st_size` is only meaningful for regular files. For pipes,
+            # sockets, character devices and the like it is zero or garbage,
+            # so report an unknown length and let chunked encoding handle it.
+            return None
+        length = st.st_size
+
+    if from_current_position:
+        try:
+            offset = stream.tell()
+        except (AttributeError, OSError):
+            # The stream can't report its position, so we can't tell how much
+            # of it has already been consumed.
+            return None
+        length = max(length - offset, 0)
 
     return length
 
@@ -174,6 +216,7 @@ class URLPattern:
         self.scheme = "" if url.scheme == "all" else url.scheme
         self.host = "" if url.host == "*" else url.host
         self.port = url.port
+        self.network = self._parse_network(url)
         if not url.host or url.host == "*":
             self.host_regex: typing.Pattern[str] | None = None
         elif url.host.startswith("*."):
@@ -189,10 +232,40 @@ class URLPattern:
             domain = re.escape(url.host)
             self.host_regex = re.compile(f"^{domain}$")
 
+    @staticmethod
+    def _parse_network(
+        url: URL,
+    ) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+        """
+        A pattern such as "all://10.0.0.0/8" or "all://[fd00::]/8" parses as an
+        IP address host with the CIDR prefix length left over in the path.
+        Recognise that form and return the network it describes, or `None`
+        if the pattern is not an IP network.
+        """
+        prefix = url.path[1:]
+        if not (url.host and url.path.startswith("/") and prefix.isdigit()):
+            return None
+        try:
+            network = ipaddress.ip_network(f"{url.host}/{prefix}", strict=False)
+        except ValueError:
+            return None
+        if network.prefixlen == network.max_prefixlen:
+            # A full-length prefix is just a single address, which is
+            # handled by the regular exact host match.
+            return None
+        return network
+
     def matches(self, other: URL) -> bool:
         if self.scheme and self.scheme != other.scheme:
             return False
-        if (
+        if self.network is not None:
+            try:
+                address = ipaddress.ip_address(other.host)
+            except ValueError:
+                return False
+            if address not in self.network:
+                return False
+        elif (
             self.host
             and self.host_regex is not None
             and not self.host_regex.match(other.host)

@@ -239,7 +239,15 @@ def urlparse(url: str = "", **kwargs: str | None) -> ParseResult:
     # Replace "netloc" with "host and "port".
     if "netloc" in kwargs:
         netloc = kwargs.pop("netloc") or ""
-        kwargs["host"], _, kwargs["port"] = netloc.partition(":")
+        if netloc.startswith("["):
+            # An IPv6 literal such as "[::1]" or "[::1]:8080". The host is
+            # everything up to and including the closing "]", and the port
+            # is whatever follows a "]:" separator, if present.
+            host_part, closing_bracket, remainder = netloc.partition("]")
+            kwargs["host"] = host_part + closing_bracket
+            kwargs["port"] = remainder[1:] if remainder.startswith(":") else remainder
+        else:
+            kwargs["host"], _, kwargs["port"] = netloc.partition(":")
 
     # Replace "username" and/or "password" with "userinfo".
     if "username" in kwargs or "password" in kwargs:
@@ -318,7 +326,7 @@ def urlparse(url: str = "", **kwargs: str | None) -> ParseResult:
     parsed_scheme: str = scheme.lower()
     parsed_userinfo: str = quote(userinfo, safe=USERINFO_SAFE)
     parsed_host: str = encode_host(host)
-    parsed_port: int | None = normalize_port(port, scheme)
+    parsed_port: int | None = normalize_port(port, parsed_scheme)
 
     has_scheme = parsed_scheme != ""
     has_authority = (
@@ -370,6 +378,11 @@ def encode_host(host: str) -> str:
         # [RFC3513] or later, is distinguished by enclosing the IP literal
         # within square brackets ("[" and "]").  This is the only place where
         # square bracket characters are allowed in the URI syntax."
+        if not host.isascii():
+            # Guard against non-ASCII characters, for example in a zone
+            # identifier, that could not be represented in the ASCII
+            # canonical form of the URL.
+            raise InvalidURL(f"Invalid IPv6 address: {host!r}")
         try:
             ipaddress.IPv6Address(host[1:-1])
         except ipaddress.AddressValueError:
@@ -405,9 +418,22 @@ def normalize_port(port: str | int | None, scheme: str) -> int | None:
     if port is None or port == "":
         return None
 
-    try:
+    # From https://tools.ietf.org/html/rfc3986#section-3.2.3
+    #
+    # port = *DIGIT
+    #
+    # Only plain ASCII digits are permitted. In particular this excludes
+    # signs, underscores, whitespace and non-ASCII (eg. fullwidth) digits,
+    # all of which `int()` would otherwise accept.
+    if isinstance(port, str):
+        if not (port.isascii() and port.isdigit()):
+            raise InvalidURL(f"Invalid port: {port!r}")
         port_as_int = int(port)
-    except ValueError:
+    else:
+        port_as_int = port
+
+    # Port numbers are 16-bit unsigned integers.
+    if not 0 <= port_as_int <= 65535:
         raise InvalidURL(f"Invalid port: {port!r}")
 
     # See https://url.spec.whatwg.org/#url-miscellaneous
@@ -472,6 +498,13 @@ def normalize_path(path: str) -> str:
                 output.pop()
         else:
             output.append(component)
+
+    # A trailing "." or ".." segment refers to a directory, so the normalized
+    # path must retain a trailing slash. For example "/a/b/.." becomes "/a/".
+    # See https://datatracker.ietf.org/doc/html/rfc3986#section-5.2.4
+    if components[-1] in (".", ".."):
+        output.append("")
+
     return "/".join(output)
 
 

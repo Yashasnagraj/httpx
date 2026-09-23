@@ -35,6 +35,26 @@ def redirects(request: httpx.Request) -> httpx.Response:
         headers = {"location": "https://:443/"}
         return httpx.Response(status_code, headers=headers)
 
+    elif request.url.path == "/malformed_redirect_no_port":
+        status_code = httpx.codes.SEE_OTHER
+        headers = {"location": "http:///redirect_body_target"}
+        return httpx.Response(status_code, headers=headers)
+
+    elif request.url.path == "/malformed_redirect_with_port":
+        status_code = httpx.codes.SEE_OTHER
+        headers = {"location": "http://:9001/redirect_body_target"}
+        return httpx.Response(status_code, headers=headers)
+
+    elif request.url.path == "/login":
+        if "Authorization" not in request.headers:
+            return httpx.Response(httpx.codes.UNAUTHORIZED)
+        return httpx.Response(httpx.codes.OK, text="Logged in")
+
+    elif request.url.path == "/redirect_to_login":
+        status_code = httpx.codes.FOUND
+        headers = {"location": "/login"}
+        return httpx.Response(status_code, headers=headers)
+
     elif request.url.path == "/invalid_redirect":
         status_code = httpx.codes.SEE_OTHER
         raw_headers = [(b"location", "https://😇/".encode("utf-8"))]
@@ -445,3 +465,98 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+def test_malformed_redirect_preserves_port():
+    # A "Location" header in absolute form without a host should inherit
+    # both the host and the port from the request URL.
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "http://example.org:8080/malformed_redirect_no_port", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "http://example.org:8080/redirect_body_target"
+    assert response.history[0].url == (
+        "http://example.org:8080/malformed_redirect_no_port"
+    )
+
+
+def test_malformed_redirect_keeps_explicit_port():
+    # An explicit port in the "Location" header takes priority over the
+    # port of the request URL.
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "http://example.org:8080/malformed_redirect_with_port", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "http://example.org:9001/redirect_body_target"
+
+
+def test_no_body_redirect_strips_content_type():
+    """
+    A 303 redirect switches to a GET request, so the body-related headers,
+    including 'Content-Type', should be removed.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.org/redirect_no_body"
+    response = client.post(url, json={"key": "value"}, follow_redirects=True)
+    assert response.url == "https://example.org/redirect_body_target"
+    assert response.json()["body"] == ""
+    headers = response.json()["headers"]
+    assert "content-type" not in headers
+    assert "content-length" not in headers
+    assert "transfer-encoding" not in headers
+
+
+class RetryOnUnauthorizedAuth(httpx.Auth):
+    """
+    An auth flow that re-sends the request with an Authorization header
+    if the initial response is a 401.
+    """
+
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        response = yield request
+        if response.status_code == httpx.codes.UNAUTHORIZED:
+            request.headers["Authorization"] = "Bearer token"
+            yield request
+
+
+def test_auth_retry_after_redirect_history():
+    # When an auth flow retries a request after a redirect has been followed,
+    # the history should include every response in chronological order.
+    client = httpx.Client(
+        transport=httpx.MockTransport(redirects),
+        auth=RetryOnUnauthorizedAuth(),
+        follow_redirects=True,
+    )
+    response = client.get("https://example.org/redirect_to_login")
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/login"
+    assert [(r.status_code, r.url.path) for r in response.history] == [
+        (302, "/redirect_to_login"),
+        (401, "/login"),
+        (302, "/redirect_to_login"),
+    ]
+    # The intermediate 401 response records the redirect that preceded it.
+    assert [(r.status_code, r.url.path) for r in response.history[1].history] == [
+        (302, "/redirect_to_login"),
+    ]
+
+
+@pytest.mark.anyio
+async def test_async_auth_retry_after_redirect_history():
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(redirects),
+        auth=RetryOnUnauthorizedAuth(),
+        follow_redirects=True,
+    )
+    response = await client.get("https://example.org/redirect_to_login")
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/login"
+    assert [(r.status_code, r.url.path) for r in response.history] == [
+        (302, "/redirect_to_login"),
+        (401, "/login"),
+        (302, "/redirect_to_login"),
+    ]

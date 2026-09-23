@@ -516,3 +516,208 @@ def test_allow_nan_false():
         ValueError, match="Out of range float values are not JSON compliant"
     ):
         httpx.Response(200, json=data_with_inf)
+
+
+@pytest.mark.anyio
+async def test_bytearray_and_memoryview_content():
+    for content in (bytearray(b"Hello, world!"), memoryview(b"Hello, world!")):
+        request = httpx.Request(method, url, content=content)  # type: ignore
+        assert isinstance(request.stream, typing.Iterable)
+        assert isinstance(request.stream, typing.AsyncIterable)
+
+        sync_content = b"".join(list(request.stream))
+        async_content = b"".join([part async for part in request.stream])
+
+        assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+        assert sync_content == b"Hello, world!"
+        assert async_content == b"Hello, world!"
+
+
+def test_text_mode_file_content(tmp_path: typing.Any) -> None:
+    path = tmp_path / "upload.txt"
+    path.write_text("Hello, world!")
+    with open(path, "r") as upload:
+        with pytest.raises(TypeError, match="binary mode"):
+            httpx.Request(method, url, content=upload)  # type: ignore
+
+    with pytest.raises(TypeError, match="binary mode"):
+        httpx.Request(method, url, content=io.StringIO("Hello, world!"))  # type: ignore
+
+
+def test_non_generator_iterator_content():
+    request = httpx.Request(method, url, content=iter([b"Hello, ", b"world!"]))
+    assert isinstance(request.stream, typing.Iterable)
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert b"".join(list(request.stream)) == b"Hello, world!"
+
+    # A single-use iterator cannot be replayed.
+    with pytest.raises(httpx.StreamConsumed):
+        list(request.stream)
+
+
+def test_bytesio_content_is_replayable():
+    request = httpx.Request(method, url, content=io.BytesIO(b"Hello, world!"))
+    assert isinstance(request.stream, typing.Iterable)
+    assert b"".join(list(request.stream)) == b"Hello, world!"
+    assert b"".join(list(request.stream)) == b"Hello, world!"
+
+    # Replay starts from wherever the file was positioned to begin with.
+    upload = io.BytesIO(b"xxHello, world!")
+    upload.seek(2)
+    request = httpx.Request(method, url, content=upload)
+    assert isinstance(request.stream, typing.Iterable)
+    assert b"".join(list(request.stream)) == b"Hello, world!"
+    assert b"".join(list(request.stream)) == b"Hello, world!"
+
+
+def test_non_seekable_filelike_content():
+    class IteratorIO(io.IOBase):
+        def __init__(self, iterator: typing.Iterator[bytes]) -> None:
+            self._iterator = iterator
+
+        def read(self, *args: typing.Any) -> bytes:
+            return b"".join(self._iterator)
+
+    def data() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    fileobj: typing.Any = IteratorIO(data())
+    request = httpx.Request(method, url, content=fileobj)
+    assert isinstance(request.stream, typing.Iterable)
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert b"".join(list(request.stream)) == b"Hello, world!"
+
+
+@pytest.mark.anyio
+async def test_non_generator_async_iterator_content():
+    class AsyncIter:
+        def __init__(self, parts: list[bytes]) -> None:
+            self._parts = iter(parts)
+
+        def __aiter__(self) -> "AsyncIter":
+            return self
+
+        async def __anext__(self) -> bytes:
+            try:
+                return next(self._parts)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    request = httpx.Request(method, url, content=AsyncIter([b"Hello, ", b"world!"]))
+    assert isinstance(request.stream, typing.AsyncIterable)
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert b"".join([part async for part in request.stream]) == b"Hello, world!"
+
+    # A single-use async iterator cannot be replayed.
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in request.stream]
+
+
+class RedirectOnceTransport(httpx.BaseTransport):
+    """
+    Iterates `request.stream` directly (as a real transport does, rather than
+    calling `request.read()`), responding with a 307 on the first request and
+    echoing the body on the second.
+    """
+
+    def __init__(self) -> None:
+        self.bodies: list[bytes] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        body = b"".join(request.stream)
+        self.bodies.append(body)
+        if len(self.bodies) == 1:
+            return httpx.Response(307, headers={"Location": "/redirected"})
+        return httpx.Response(200, content=body)
+
+
+class AsyncRedirectOnceTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.bodies: list[bytes] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)
+        body = b"".join([part async for part in request.stream])
+        self.bodies.append(body)
+        if len(self.bodies) == 1:
+            return httpx.Response(307, headers={"Location": "/redirected"})
+        return httpx.Response(200, content=body)  # pragma: no cover
+
+
+def test_filelike_content_replayed_on_redirect():
+    transport = RedirectOnceTransport()
+    with httpx.Client(transport=transport, follow_redirects=True) as client:
+        response = client.post(url, content=io.BytesIO(b"Hello, world!"))
+
+    assert response.status_code == 200
+    assert transport.bodies == [b"Hello, world!", b"Hello, world!"]
+    assert response.content == b"Hello, world!"
+
+
+def test_iterator_content_not_silently_empty_on_redirect():
+    transport = RedirectOnceTransport()
+    with httpx.Client(transport=transport, follow_redirects=True) as client:
+        with pytest.raises(httpx.StreamConsumed):
+            client.post(url, content=iter([b"Hello, ", b"world!"]))
+
+    assert transport.bodies == [b"Hello, world!"]
+
+
+@pytest.mark.anyio
+async def test_async_iterator_content_not_silently_empty_on_redirect():
+    class AsyncIter:
+        def __init__(self, parts: list[bytes]) -> None:
+            self._parts = iter(parts)
+
+        def __aiter__(self) -> "AsyncIter":
+            return self
+
+        async def __anext__(self) -> bytes:
+            try:
+                return next(self._parts)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    transport = AsyncRedirectOnceTransport()
+    async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+        with pytest.raises(httpx.StreamConsumed):
+            await client.post(url, content=AsyncIter([b"Hello, ", b"world!"]))
+
+    assert transport.bodies == [b"Hello, world!"]
+
+
+@pytest.mark.anyio
+async def test_urlencoded_bytes():
+    request = httpx.Request(method, url, data={"key": b"value"})
+    assert isinstance(request.stream, typing.Iterable)
+    assert b"".join(list(request.stream)) == b"key=value"
+    assert request.headers["Content-Type"] == "application/x-www-form-urlencoded"
+
+    request = httpx.Request(method, url, data={"key": [b"a", "b", b"\xff"]})
+    assert isinstance(request.stream, typing.Iterable)
+    assert b"".join(list(request.stream)) == b"key=a&key=b&key=%FF"
+
+
+@pytest.mark.anyio
+async def test_bytestream_async_iterator_protocol():
+    """
+    `ByteStream.__aiter__` returns a real async iterator, not an async
+    generator, so it is safe to abandon part-way through.
+    """
+    stream = httpx.ByteStream(b"Hello, world!")
+    iterator = stream.__aiter__()
+    assert iterator.__aiter__() is iterator
+    assert await iterator.__anext__() == b"Hello, world!"
+    with pytest.raises(StopAsyncIteration):
+        await iterator.__anext__()

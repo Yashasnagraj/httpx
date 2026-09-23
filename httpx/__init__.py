@@ -1,3 +1,5 @@
+import typing as _typing
+
 from .__version__ import __description__, __title__, __version__
 from ._api import *
 from ._auth import *
@@ -11,19 +13,53 @@ from ._transports import *
 from ._types import *
 from ._urls import *
 
-try:
+
+class _LazyMain:
+    """
+    Entry point for the `httpx` command line client.
+
+    The CLI depends on `click`, `rich` and `pygments`, which are slow to import
+    and only needed when the command is actually run, so `httpx._main` is
+    imported on first use rather than when `httpx` itself is imported.
+    """
+
+    @staticmethod
+    def _resolve() -> _typing.Any:
+        try:
+            from ._main import main
+        except ImportError:  # pragma: no cover
+            return None
+        return main
+
+    def __call__(self, *args: _typing.Any, **kwargs: _typing.Any) -> _typing.Any:
+        command = self._resolve()
+        if command is None:  # pragma: no cover
+            import sys
+
+            print(
+                "The httpx command line client could not run because the required "
+                "dependencies were not installed.\nMake sure you've installed "
+                "everything with: pip install 'httpx[cli]'"
+            )
+            sys.exit(1)
+        return command(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> _typing.Any:
+        # Forward attribute access (e.g. `.main`, used by `click.testing`) to
+        # the underlying click command. Dunder lookups are answered locally so
+        # that introspection doesn't trigger the import.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        command = self._resolve()
+        if command is None:  # pragma: no cover
+            raise AttributeError(name)
+        return getattr(command, name)
+
+
+if _typing.TYPE_CHECKING:  # pragma: no cover
     from ._main import main
-except ImportError:  # pragma: no cover
-
-    def main() -> None:  # type: ignore
-        import sys
-
-        print(
-            "The httpx command line client could not run because the required "
-            "dependencies were not installed.\nMake sure you've installed "
-            "everything with: pip install 'httpx[cli]'"
-        )
-        sys.exit(1)
+else:
+    main = _LazyMain()
 
 
 __all__ = [

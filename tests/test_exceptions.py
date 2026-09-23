@@ -40,9 +40,11 @@ def test_httpcore_exception_mapping(server: TestServer) -> None:
     """
     HTTPCore exception mapping works as expected.
     """
-    impossible_port = 123456
+    # Port 1 (tcpmux) is reserved and never bound by the test server,
+    # so connecting to it is refused immediately.
+    closed_port = 1
     with pytest.raises(httpx.ConnectError):
-        httpx.get(server.url.copy_with(port=impossible_port))
+        httpx.get(server.url.copy_with(port=closed_port))
 
     with pytest.raises(httpx.ReadTimeout):
         httpx.get(

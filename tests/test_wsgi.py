@@ -5,6 +5,7 @@ import typing
 import wsgiref.validate
 from functools import partial
 from io import StringIO
+from urllib.parse import unquote
 
 import pytest
 
@@ -201,3 +202,193 @@ def test_wsgi_server_protocol():
     assert response.status_code == 200
     assert response.text == "success"
     assert server_protocol == "HTTP/1.1"
+
+
+def test_wsgi_chunked_request_body_is_buffered():
+    """
+    A streamed request body is fully buffered into `wsgi.input`, so the app is
+    told the content length rather than seeing `Transfer-Encoding: chunked`.
+    """
+    seen_environ: dict[str, typing.Any] = {}
+
+    def app(environ, start_response):
+        seen_environ.update(environ)
+        body = environ["wsgi.input"].read()
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [body]
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.post("http://www.example.org/", content=iter([b"ex", b"ample"]))
+    assert response.status_code == 200
+    assert response.text == "example"
+    assert seen_environ["CONTENT_LENGTH"] == "7"
+    assert seen_environ["wsgi.input_terminated"] is True
+    assert "HTTP_TRANSFER_ENCODING" not in seen_environ
+
+
+def test_wsgi_no_content_length_without_body():
+    seen_environ: dict[str, typing.Any] = {}
+
+    def app(environ, start_response):
+        seen_environ.update(environ)
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert "CONTENT_LENGTH" not in seen_environ
+
+
+@pytest.mark.parametrize(
+    "path, expected_path_info",
+    [
+        pytest.param("/café", "/caf\xc3\xa9", id="latin-1-range"),
+        pytest.param("/tick/✓", "/tick/\xe2\x9c\x93", id="outside-latin-1"),
+        pytest.param("/a%20b", "/a b", id="percent-encoded"),
+        pytest.param("/plain", "/plain", id="ascii"),
+    ],
+)
+def test_wsgi_path_info_is_native_string(path: str, expected_path_info: str) -> None:
+    """
+    PEP 3333 requires `PATH_INFO` to be the percent-decoded UTF-8 bytes of the
+    path, decoded as latin-1 (a "native string"), so that frameworks can
+    recover the original path with `.encode("latin-1").decode("utf-8")`.
+    """
+    seen_environ: dict[str, typing.Any] = {}
+
+    def app(environ, start_response):
+        seen_environ.update(environ)
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get(httpx.URL("http://www.example.org/").copy_with(path=path))
+    assert response.status_code == 200
+    assert seen_environ["PATH_INFO"] == expected_path_info
+    assert seen_environ["PATH_INFO"].encode("latin-1").decode("utf-8") == unquote(path)
+
+
+@pytest.mark.parametrize(
+    "script_name, expected_script_name",
+    [
+        pytest.param("/submount", "/submount", id="ascii"),
+        pytest.param("/café", "/caf\xc3\xa9", id="unicode"),
+        pytest.param("/caf%C3%A9", "/caf\xc3\xa9", id="percent-encoded"),
+    ],
+)
+def test_wsgi_script_name_is_native_string(
+    script_name: str, expected_script_name: str
+) -> None:
+    seen_environ: dict[str, typing.Any] = {}
+
+    def app(environ, start_response):
+        seen_environ.update(environ)
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+    transport = httpx.WSGITransport(app=app, script_name=script_name)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert seen_environ["SCRIPT_NAME"] == expected_script_name
+
+
+def test_wsgi_write_callable():
+    """
+    Data passed to the `write()` callable returned by `start_response` is sent
+    ahead of the data yielded by the response iterable.
+    """
+
+    def app(environ, start_response):
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        write(b"Hello, ")
+        return [b"World!"]
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+
+
+def test_wsgi_write_callable_from_generator():
+    def app(environ, start_response):
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        write(b"1")
+        yield b"2"
+        write(b"3")
+        yield b"4"
+        write(b"5")
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "12345"
+
+
+def test_wsgi_write_callable_only():
+    def app(environ, start_response):
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        write(b"written")
+        return []
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "written"
+
+
+def test_wsgi_exc_closes_result_iterable():
+    """
+    When the app exception is re-raised the response iterable's `close()`
+    must still be called, as required by PEP 3333.
+    """
+    closed = False
+
+    class Result:
+        def __iter__(self):
+            return iter([b"Nope!"])
+
+        def close(self):
+            nonlocal closed
+            closed = True
+
+    def app(environ, start_response):
+        try:
+            raise ValueError()
+        except ValueError:
+            start_response("500 Server Error", [], sys.exc_info())
+        return Result()
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError):
+        client.get("http://www.example.org/")
+    assert closed
+
+
+def test_wsgi_latin1_headers():
+    """
+    PEP 3333 header values are latin-1, not ASCII, in both directions.
+    """
+    seen_environ: dict[str, typing.Any] = {}
+
+    def app(environ, start_response):
+        seen_environ.update(environ)
+        start_response("200 OK", [("Content-Type", "text/plain"), ("X-Name", "café")])
+        return [b"ok"]
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get(
+        "http://www.example.org/", headers={b"X-Name": "café".encode("latin-1")}
+    )
+    assert response.status_code == 200
+    assert seen_environ["HTTP_X_NAME"] == "café"
+    assert response.headers["X-Name"] == "café"

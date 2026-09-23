@@ -149,6 +149,9 @@ class HTTPTransport(BaseTransport):
     ) -> None:
         import httpcore
 
+        if not http1 and not http2:
+            raise ValueError("Either http1 or http2 must be enabled")
+
         proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
         ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
 
@@ -182,6 +185,9 @@ class HTTPTransport(BaseTransport):
                 keepalive_expiry=limits.keepalive_expiry,
                 http1=http1,
                 http2=http2,
+                uds=uds,
+                local_address=local_address,
+                retries=retries,
                 socket_options=socket_options,
             )
         elif proxy.url.scheme in ("socks5", "socks5h"):
@@ -207,6 +213,7 @@ class HTTPTransport(BaseTransport):
                 keepalive_expiry=limits.keepalive_expiry,
                 http1=http1,
                 http2=http2,
+                retries=retries,
             )
         else:  # pragma: no cover
             raise ValueError(
@@ -293,6 +300,9 @@ class AsyncHTTPTransport(AsyncBaseTransport):
     ) -> None:
         import httpcore
 
+        if not http1 and not http2:
+            raise ValueError("Either http1 or http2 must be enabled")
+
         proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
         ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
 
@@ -326,6 +336,9 @@ class AsyncHTTPTransport(AsyncBaseTransport):
                 keepalive_expiry=limits.keepalive_expiry,
                 http1=http1,
                 http2=http2,
+                uds=uds,
+                local_address=local_address,
+                retries=retries,
                 socket_options=socket_options,
             )
         elif proxy.url.scheme in ("socks5", "socks5h"):
@@ -351,6 +364,7 @@ class AsyncHTTPTransport(AsyncBaseTransport):
                 keepalive_expiry=limits.keepalive_expiry,
                 http1=http1,
                 http2=http2,
+                retries=retries,
             )
         else:  # pragma: no cover
             raise ValueError(

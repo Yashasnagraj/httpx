@@ -59,6 +59,53 @@ def test_build_request(server):
     assert response.json()["Custom-header"] == "value"
 
 
+def test_send_explicit_request_uses_client_timeout():
+    """
+    Sending a plain `httpx.Request()` that was not built via `build_request()`
+    should have the client-level timeout applied.
+    """
+    transport = httpx.MockTransport(lambda request: httpx.Response(200))
+    with httpx.Client(transport=transport, timeout=1.5) as client:
+        request = httpx.Request("GET", "http://www.example.com")
+        assert "timeout" not in request.extensions
+        response = client.send(request)
+
+    assert response.status_code == 200
+    assert response.request.extensions["timeout"] == httpx.Timeout(1.5).as_dict()
+
+
+def test_cancellation_during_stream():
+    """
+    If any BaseException is raised while reading the response, then the
+    stream should be closed.
+
+    See https://github.com/encode/httpx/issues/2139
+    """
+    stream_was_closed = False
+
+    def response_with_cancel_during_stream(request):
+        class CancelledStream(httpx.SyncByteStream):
+            def __iter__(self) -> typing.Iterator[bytes]:
+                yield b"Hello"
+                raise KeyboardInterrupt()
+                yield b", world"  # pragma: no cover
+
+            def close(self) -> None:
+                nonlocal stream_was_closed
+                stream_was_closed = True
+
+        return httpx.Response(
+            200, headers={"Content-Length": "12"}, stream=CancelledStream()
+        )
+
+    transport = httpx.MockTransport(response_with_cancel_during_stream)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(KeyboardInterrupt):
+            client.get("https://www.example.com")
+        assert stream_was_closed
+
+
 def test_build_post_request(server):
     url = server.url.copy_with(path="/echo_headers")
     headers = {"Custom-header": "value"}
@@ -227,6 +274,94 @@ def test_merge_relative_url_with_encoded_slashes():
     client = httpx.Client(base_url="https://www.example.com/base%2Fpath")
     request = client.build_request("GET", "/testing")
     assert request.url == "https://www.example.com/base%2Fpath/testing"
+
+
+def test_merge_relative_url_with_base_url_query():
+    client = httpx.Client(base_url="https://www.example.com/api?token=1")
+    assert client.base_url == "https://www.example.com/api/?token=1"
+
+    request = client.build_request("GET", "path?x=2")
+    assert request.url == "https://www.example.com/api/path?token=1&x=2"
+
+    request = client.build_request("GET", "/path")
+    assert request.url == "https://www.example.com/api/path?token=1"
+
+    # The request URL query takes priority over the base URL query.
+    request = client.build_request("GET", "path?token=2")
+    assert request.url == "https://www.example.com/api/path?token=2"
+
+    # Absolute URLs are not merged with the base URL.
+    request = client.build_request("GET", "https://other.example.com/path")
+    assert request.url == "https://other.example.com/path"
+
+
+def test_base_url_with_query_and_trailing_slash():
+    client = httpx.Client(base_url="https://www.example.com/api/?token=1")
+    assert client.base_url == "https://www.example.com/api/?token=1"
+    request = client.build_request("GET", "path")
+    assert request.url == "https://www.example.com/api/path?token=1"
+
+
+def test_client_params_merge_with_url_query():
+    client = httpx.Client(params={"a": "1", "b": "2"})
+
+    # The query embedded in the request URL takes priority over client params.
+    request = client.build_request("GET", "https://www.example.com/p?a=3")
+    assert request.url == "https://www.example.com/p?a=3&b=2"
+
+    # Explicit request params take priority over both.
+    request = client.build_request(
+        "GET", "https://www.example.com/p?a=3", params={"a": "4"}
+    )
+    assert request.url == "https://www.example.com/p?a=4&b=2"
+
+    # An explicit empty `params={}` replaces the URL query string.
+    request = client.build_request("GET", "https://www.example.com/p?c=5", params={})
+    assert request.url == "https://www.example.com/p?a=1&b=2"
+
+
+def test_request_params_without_client_params():
+    client = httpx.Client()
+
+    request = client.build_request("GET", "https://www.example.com/p?a=1")
+    assert request.url == "https://www.example.com/p?a=1"
+
+    request = client.build_request("GET", "https://www.example.com/p?a=1", params={})
+    assert request.url == "https://www.example.com/p"
+
+    request = client.build_request(
+        "GET", "https://www.example.com/p?a=1", params={"b": "2"}
+    )
+    assert request.url == "https://www.example.com/p?b=2"
+
+
+def test_close_mounts_when_transport_close_raises():
+    class Transport(httpx.BaseTransport):
+        def __init__(self, name: str, raises: bool = False) -> None:
+            self.name = name
+            self.raises = raises
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            if self.raises:
+                raise RuntimeError(f"{self.name} failed to close")
+
+    transport = Transport(name="transport", raises=True)
+    mounted = Transport(name="mounted", raises=True)
+    other = Transport(name="other")
+    client = httpx.Client(
+        transport=transport,
+        mounts={"http://www.example.org": mounted, "https://": other},
+    )
+
+    with pytest.raises(RuntimeError, match="transport failed to close"):
+        client.close()
+
+    assert transport.closed
+    assert mounted.closed
+    assert other.closed
+    assert client.is_closed
 
 
 def test_context_managed_transport():
@@ -431,7 +566,8 @@ def test_client_decode_text_using_autodetect():
 
         assert response.status_code == 200
         assert response.reason_phrase == "OK"
-        assert response.encoding == "ISO-8859-1"
+        # chardet < 6 reports ISO-8859-1, chardet >= 6 reports WINDOWS-1252.
+        assert response.encoding in ("ISO-8859-1", "WINDOWS-1252")
         assert response.text == text
 
 
@@ -458,5 +594,6 @@ def test_client_decode_text_using_explicit_encoding():
 
         assert response.status_code == 200
         assert response.reason_phrase == "OK"
-        assert response.encoding == "ISO-8859-1"
+        # chardet < 6 reports ISO-8859-1, chardet >= 6 reports WINDOWS-1252.
+        assert response.encoding in ("ISO-8859-1", "WINDOWS-1252")
         assert response.text == text

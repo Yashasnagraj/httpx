@@ -20,10 +20,13 @@ def test_load_ssl_config_verify_non_existing_file():
         context.load_verify_locations(cafile="/path/to/nowhere")
 
 
-def test_load_ssl_with_keylog(monkeypatch: typing.Any) -> None:
-    monkeypatch.setenv("SSLKEYLOGFILE", "test")
+def test_load_ssl_with_keylog(monkeypatch: typing.Any, tmp_path: Path) -> None:
+    # Use a temporary path: OpenSSL creates the key log file as soon as the
+    # context is configured, so a relative name would litter the repository.
+    keylog_file = str(tmp_path / "keylog.txt")
+    monkeypatch.setenv("SSLKEYLOGFILE", keylog_file)
     context = httpx.create_ssl_context()
-    assert context.keylog_filename == "test"
+    assert context.keylog_filename == keylog_file
 
 
 def test_load_ssl_config_verify_existing_file():
@@ -71,6 +74,44 @@ def test_load_ssl_config_cert_without_key_raises(cert_pem_file):
     with pytest.raises(ssl.SSLError):
         context = httpx.create_ssl_context()
         context.load_cert_chain(cert_pem_file)
+
+
+def test_load_ssl_config_verify_str_applies_cert(
+    monkeypatch, cert_pem_file, cert_private_key_file
+):
+    """
+    The deprecated `verify=<str>` form used to return early and silently
+    ignore an accompanying `cert=...` argument.
+    """
+    calls = []
+
+    def load_cert_chain(self, *args):
+        calls.append(args)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", load_cert_chain)
+
+    with pytest.warns(DeprecationWarning):
+        context = httpx.create_ssl_context(
+            verify=cert_pem_file, cert=(cert_pem_file, cert_private_key_file)
+        )
+
+    assert context.verify_mode == ssl.VerifyMode.CERT_REQUIRED
+    assert calls == [(cert_pem_file, cert_private_key_file)]
+
+    calls.clear()
+    with pytest.warns(DeprecationWarning):
+        httpx.create_ssl_context(verify=cert_pem_file, cert=cert_pem_file)
+    assert calls == [(cert_pem_file,)]
+
+
+def test_load_ssl_config_verify_str_directory(cert_pem_file, cert_private_key_file):
+    with pytest.warns(DeprecationWarning):
+        context = httpx.create_ssl_context(
+            verify=str(Path(certifi.where()).parent),
+            cert=(cert_pem_file, cert_private_key_file),
+        )
+    assert context.verify_mode == ssl.VerifyMode.CERT_REQUIRED
+    assert context.check_hostname is True
 
 
 def test_load_ssl_config_no_verify():
@@ -153,6 +194,40 @@ def test_timeout_from_config_instance():
     assert httpx.Timeout(timeout) == httpx.Timeout(timeout=5.0)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [{"connect": 1.0}, {"read": None}, {"write": 1.0}, {"pool": 1.0}],
+)
+def test_timeout_from_config_instance_with_overrides_raises(overrides):
+    """
+    Combining a Timeout instance with per-operation overrides is ambiguous,
+    and must raise a clear ValueError rather than silently dropping the
+    overrides (or a bare AssertionError).
+    """
+    timeout = httpx.Timeout(timeout=5.0)
+    with pytest.raises(ValueError, match="cannot combine"):
+        httpx.Timeout(timeout, **overrides)
+
+
+@pytest.mark.parametrize("value", [(), (5.0,), (1.0, 2.0, 3.0, 4.0, 5.0)])
+def test_timeout_from_invalid_tuple_raises(value):
+    with pytest.raises(ValueError, match="between 2 and 4 items"):
+        httpx.Timeout(value)
+
+
+@pytest.mark.parametrize(
+    ["value", "expected"],
+    [
+        ((1.0, 2.0), (1.0, 2.0, None, None)),
+        ((1.0, 2.0, 3.0), (1.0, 2.0, 3.0, None)),
+        ((1.0, 2.0, 3.0, 4.0), (1.0, 2.0, 3.0, 4.0)),
+    ],
+)
+def test_timeout_from_valid_tuples(value, expected):
+    timeout = httpx.Timeout(value)
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == expected
+
+
 def test_timeout_repr():
     timeout = httpx.Timeout(timeout=5.0)
     assert repr(timeout) == "Timeout(timeout=5.0)"
@@ -177,6 +252,20 @@ def test_proxy_with_auth_from_url():
     assert proxy.auth == ("username", "password")
     assert proxy.headers == {}
     assert repr(proxy) == "Proxy('https://example.com', auth=('username', '********'))"
+
+
+def test_proxy_explicit_auth_overrides_url_auth():
+    """
+    An explicit `auth=` argument takes precedence over credentials in the URL.
+    """
+    proxy = httpx.Proxy(
+        "https://username:password@example.com", auth=("other", "secret")
+    )
+
+    assert str(proxy.url) == "https://example.com"
+    assert proxy.auth == ("other", "secret")
+    assert proxy.raw_auth == (b"other", b"secret")
+    assert repr(proxy) == "Proxy('https://example.com', auth=('other', '********'))"
 
 
 def test_invalid_proxy_scheme():

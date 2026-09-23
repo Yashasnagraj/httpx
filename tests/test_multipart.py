@@ -52,6 +52,9 @@ def test_multipart(value, output):
         'multipart/form-data; charset=utf-8; boundary="+++"',
         'multipart/form-data; boundary="+++"',
         'multipart/form-data; boundary="+++" ;',
+        # The media type is case-insensitive.
+        "Multipart/Form-Data; boundary=+++",
+        "MULTIPART/FORM-DATA; boundary=+++",
     ],
 )
 def test_multipart_explicit_boundary(header: str) -> None:
@@ -84,6 +87,10 @@ def test_multipart_explicit_boundary(header: str) -> None:
     ],
 )
 def test_multipart_header_without_boundary(header: str) -> None:
+    """
+    A user-supplied multipart Content-Type without a boundary cannot describe
+    the body, so it is replaced by one carrying the boundary actually used.
+    """
     client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
 
     files = {"file": io.BytesIO(b"<file content>")}
@@ -91,7 +98,25 @@ def test_multipart_header_without_boundary(header: str) -> None:
     response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
 
     assert response.status_code == 200
-    assert response.request.headers["Content-Type"] == header
+    content_type = response.request.headers["Content-Type"]
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = content_type[len("multipart/form-data; boundary=") :].encode()
+    assert response.content.startswith(b"--" + boundary + b"\r\n")
+    assert response.content.endswith(b"--" + boundary + b"--\r\n")
+
+
+def test_multipart_non_multipart_content_type_header_is_replaced() -> None:
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"content-type": "application/json"}
+    response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
+
+    assert response.status_code == 200
+    content_type = response.request.headers["Content-Type"]
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = content_type[len("multipart/form-data; boundary=") :].encode()
+    assert response.content.startswith(b"--" + boundary + b"\r\n")
 
 
 @pytest.mark.parametrize(("key"), (b"abc", 1, 2.3, None))
@@ -467,3 +492,48 @@ class TestHeaderParamHTML5Formatting:
         files = {"upload": (filename, b"<file content>")}
         request = httpx.Request("GET", "https://www.example.com", files=files)
         assert expected in request.read()
+
+
+def test_multipart_encode_files_raises_exception_with_text_mode_wrapper() -> None:
+    """
+    File-like wrappers that are not `io.TextIOBase` instances, but report a
+    text `mode` (such as `tempfile.TemporaryFile(mode="w")` on Windows), are
+    rejected too.
+    """
+
+    class TextModeFile:
+        mode = "w"
+
+        def read(self, size: int = -1) -> str:
+            return ""  # pragma: no cover
+
+    url = "https://www.example.com"
+    files = {"file": ("test.txt", TextModeFile(), "text/plain")}
+    with pytest.raises(TypeError, match="binary mode"):
+        httpx.Request("POST", url, data={}, files=files)  # type: ignore
+
+
+def test_multipart_file_tuple_headers_are_not_mutated() -> None:
+    file_headers = {"Expires": "0"}
+    files = {"file": ("test.txt", io.BytesIO(b"<file content>"), None, file_headers)}
+
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+    request.read()
+
+    assert b"Content-Type: text/plain\r\n" in request.content
+    assert file_headers == {"Expires": "0"}
+
+
+def test_multipart_file_tuple_headers_content_type_exact_match() -> None:
+    """
+    Only an actual `Content-Type` header suppresses the automatic one, not
+    any header whose name merely contains "content-type".
+    """
+    file_headers = {"X-Content-Type-Options": "nosniff"}
+    files = {"file": ("test.txt", io.BytesIO(b"<file content>"), None, file_headers)}
+
+    request = httpx.Request("POST", "https://www.example.com/", files=files)
+    request.read()
+
+    assert b"\r\nX-Content-Type-Options: nosniff\r\n" in request.content
+    assert b"\r\nContent-Type: text/plain\r\n" in request.content

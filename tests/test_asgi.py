@@ -222,3 +222,60 @@ async def test_asgi_exc_no_raise():
         response = await client.get("http://www.example.org/")
 
         assert response.status_code == 500
+
+
+async def return_without_response(scope, receive, send):
+    pass
+
+
+async def return_with_incomplete_body(scope, receive, send):
+    headers = [(b"content-type", b"text/plain")]
+    await send({"type": "http.response.start", "status": 200, "headers": headers})
+    await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+
+
+async def echo_server(scope, receive, send):
+    host, port = scope["server"]
+    output = json.dumps({"host": host, "port": port}).encode("utf-8")
+    headers = [(b"content-type", b"application/json")]
+
+    await send({"type": "http.response.start", "status": 200, "headers": headers})
+    await send({"type": "http.response.body", "body": output})
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("app", [return_without_response, return_with_incomplete_body])
+async def test_asgi_incomplete_response_raises(app):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError, match="did not send a complete response"):
+            await client.get("http://www.example.org/")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("app", [return_without_response, return_with_incomplete_body])
+async def test_asgi_incomplete_response_no_raise(app):
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 500
+    assert response.content == b""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "url, expected_port",
+    [
+        pytest.param("http://www.example.org/", 80, id="auto-http"),
+        pytest.param("https://www.example.org/", 443, id="auto-https"),
+        pytest.param("http://www.example.org:8000/", 8000, id="explicit-port"),
+    ],
+)
+async def test_asgi_server_port(url, expected_port):
+    transport = httpx.ASGITransport(app=echo_server)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"host": "www.example.org", "port": expected_port}

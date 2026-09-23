@@ -1,6 +1,7 @@
 import pytest
 
 import httpx
+from httpx._urlparse import normalize_port
 
 # Tests for `httpx.URL` instantiation and property accessors.
 
@@ -255,12 +256,102 @@ def test_url_invalid_port():
     assert str(exc.value) == "Invalid port: 'abc'"
 
 
+def test_url_normalized_port_with_uppercase_scheme():
+    # Default port normalization must use the lowercased scheme.
+    url = httpx.URL("HTTP://example.com:80/")
+    assert url.port is None
+    assert str(url) == "http://example.com/"
+    assert httpx.URL("HTTPS://example.com:443/").port is None
+
+
+def test_url_empty_port():
+    # An empty port component is treated as no port.
+    url = httpx.URL("https://example.com:/")
+    assert url.port is None
+    assert str(url) == "https://example.com/"
+
+
+@pytest.mark.parametrize("port", ["0", "65535", "8080"])
+def test_url_port_boundaries(port):
+    url = httpx.URL(f"https://example.com:{port}/")
+    assert url.port == int(port)
+    assert str(url) == f"https://example.com:{port}/"
+
+
+@pytest.mark.parametrize(
+    "port",
+    ["-1", "65536", "1_0", "+80", "８０", " 80", "80 ", "8.0", "1e3"],
+)
+def test_url_invalid_port_values(port):
+    # Only plain ASCII digits within the 16-bit range are permitted.
+    # Note that `int()` alone would accept most of these.
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL(f"https://example.com:{port}/")
+    assert str(exc.value) == f"Invalid port: {port!r}"
+
+
+@pytest.mark.parametrize("port", [-1, 65536])
+def test_url_invalid_int_port(port):
+    # Integer ports are coerced to strings before validation.
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("https://example.com/", port=port)
+    assert str(exc.value) == f"Invalid port: {str(port)!r}"
+
+
+def test_normalize_port_with_int():
+    # `normalize_port` also accepts integers directly, which are range checked.
+    assert normalize_port(8080, "https") == 8080
+    assert normalize_port(443, "https") is None
+    with pytest.raises(httpx.InvalidURL) as exc:
+        normalize_port(65536, "https")
+    assert str(exc.value) == "Invalid port: 65536"
+    with pytest.raises(httpx.InvalidURL) as exc:
+        normalize_port(-1, "https")
+    assert str(exc.value) == "Invalid port: -1"
+
+
 # Tests for path handling
 
 
 def test_url_normalized_path():
     url = httpx.URL("https://example.com/abc/def/../ghi/./jkl")
     assert url.path == "/abc/ghi/jkl"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/a/b/..",
+        "/a/.",
+        "/abc/def/../ghi/./jkl",
+        "/..",
+        "/.",
+        "/a/..",
+        "/a//.",
+        "/a//..",
+        "/a/b/../",
+        "/a/./b",
+        "/a/b/./.",
+        "/a/../../b/..",
+        "/a/b/c/../..",
+        "/./..",
+        "/a/..b",
+    ],
+)
+def test_url_normalized_path_matches_urljoin(path):
+    # Dot segment removal must match RFC 3986 section 5.2.4, which is
+    # also what the stdlib implements. In particular a trailing "." or ".."
+    # segment refers to a directory, and so retains the trailing slash.
+    from urllib.parse import urljoin
+
+    url = httpx.URL("https://example.com" + path)
+    assert str(url) == urljoin("https://example.com/", path)
+
+
+def test_url_trailing_dot_segments_keep_trailing_slash():
+    assert httpx.URL("https://example.com/a/b/..").path == "/a/"
+    assert httpx.URL("https://example.com/a/.").path == "/a/"
+    assert httpx.URL("https://example.com/a/..").path == "/"
 
 
 def test_url_escaped_path():
@@ -438,6 +529,16 @@ def test_url_eq_str():
     assert str(url) == url
 
 
+def test_url_eq_invalid_str():
+    # Comparing against a string that is not a valid URL is simply unequal,
+    # rather than raising an exception.
+    url = httpx.URL("https://example.org")
+    assert not (url == "https://example.org:abc")
+    assert url != "https://example.org:abc"
+    assert url != "https://example.org\n"
+    assert url != 123
+
+
 def test_url_set():
     """
     Ensure that `httpx.URL` instances can be used in sets.
@@ -603,6 +704,53 @@ def test_url_copywith_netloc():
     assert str(new) == "https://example.net:444"
 
 
+@pytest.mark.parametrize(
+    "netloc,expected,host,port",
+    [
+        (b"[::1]:8080", "https://[::1]:8080", "::1", 8080),
+        (b"[::1]", "https://[::1]", "::1", None),
+        (b"[::1]:443", "https://[::1]", "::1", None),
+        (
+            b"[fe80::1%25eth0]:8080",
+            "https://[fe80::1%25eth0]:8080",
+            "fe80::1%25eth0",
+            8080,
+        ),
+    ],
+)
+def test_url_copywith_ipv6_netloc(netloc, expected, host, port):
+    url = httpx.URL("https://example.org")
+    new = url.copy_with(netloc=netloc)
+    assert str(new) == expected
+    assert new.host == host
+    assert new.port == port
+
+
+def test_url_copywith_invalid_ipv6_netloc():
+    url = httpx.URL("https://example.org")
+    with pytest.raises(httpx.InvalidURL) as exc:
+        url.copy_with(netloc=b"[::1]x")
+    assert str(exc.value) == "Invalid port: 'x'"
+    # A missing closing bracket is not silently repaired.
+    with pytest.raises(httpx.InvalidURL) as exc:
+        url.copy_with(netloc=b"[::1")
+    assert str(exc.value).startswith("Invalid IPv6 address")
+
+
+def test_url_scheme_and_absolute_properties():
+    url = httpx.URL("https://user:pass@example.org/path")
+    assert url.raw_scheme == b"https"
+    assert url.is_absolute_url
+    assert not url.is_relative_url
+    # The password is masked in the repr.
+    assert repr(url) == "URL('https://user:[secure]@example.org/path')"
+
+    url = httpx.URL("/path")
+    assert url.raw_scheme == b""
+    assert not url.is_absolute_url
+    assert url.is_relative_url
+
+
 def test_url_copywith_userinfo_subcomponents():
     copy_with_kwargs = {
         "username": "tom@example.org",
@@ -614,6 +762,38 @@ def test_url_copywith_userinfo_subcomponents():
     assert new.username == "tom@example.org"
     assert new.password == "abc123@ %"
     assert new.userinfo == b"tom%40example.org:abc123%40%20%"
+
+
+def test_url_copywith_username_preserves_password():
+    # Changing only the username must not drop the existing password.
+    url = httpx.URL("https://user:pass@example.org")
+    new = url.copy_with(username="new")
+    assert str(new) == "https://new:pass@example.org"
+    assert new.username == "new"
+    assert new.password == "pass"
+
+
+def test_url_copywith_password_preserves_username():
+    # Changing only the password must not drop the existing username.
+    url = httpx.URL("https://user:pass@example.org")
+    new = url.copy_with(password="new")
+    assert str(new) == "https://user:new@example.org"
+    assert new.username == "user"
+    assert new.password == "new"
+
+    # Also when there was no password previously.
+    url = httpx.URL("https://user@example.org")
+    new = url.copy_with(password="new")
+    assert str(new) == "https://user:new@example.org"
+
+
+def test_url_copywith_username_and_password():
+    # Setting both replaces both.
+    url = httpx.URL("https://user:pass@example.org")
+    new = url.copy_with(username="a", password="b")
+    assert str(new) == "https://a:b@example.org"
+    new = url.copy_with(username=None, password=None)
+    assert str(new) == "https://example.org"
 
 
 def test_url_copywith_invalid_component():
@@ -796,6 +976,32 @@ def test_url_escaped_idna_host():
     assert url.raw_host == b"xn--fiqs8s.icom.museum"
 
 
+def test_url_idna_host_decodes_any_label():
+    # IDNA decoding applies when any label is punycode, not only the first.
+    url = httpx.URL("https://www.xn--mller-kva.de/")
+    assert url.host == "www.müller.de"
+    assert url.raw_host == b"www.xn--mller-kva.de"
+
+    url = httpx.URL("https://www.xn--mller-kva.example.xn--fiqs8s/")
+    assert url.host == "www.müller.example.中国"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "xn--zzzzzz.com",
+        "xn--",
+        "xn--mller-kva.my_host.example.com",
+    ],
+)
+def test_url_host_with_invalid_punycode(host):
+    # A host that looks like punycode but does not decode is returned as-is
+    # rather than raising an exception.
+    url = httpx.URL(f"https://{host}/")
+    assert url.host == host
+    assert url.raw_host == host.encode("ascii")
+
+
 def test_url_invalid_idna_host():
     with pytest.raises(httpx.InvalidURL) as exc:
         httpx.URL("https://☃.com/")
@@ -835,6 +1041,15 @@ def test_url_invalid_ipv6():
     with pytest.raises(httpx.InvalidURL) as exc:
         httpx.URL("https://[2001]/")
     assert str(exc.value) == "Invalid IPv6 address: '[2001]'"
+
+
+def test_url_ipv6_with_non_ascii_zone_id():
+    # A non-ASCII zone identifier cannot be represented in the ASCII
+    # canonical form, so it must be rejected rather than raising a
+    # UnicodeEncodeError when accessing `raw_host`.
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("http://[fe80::1%é]/")
+    assert str(exc.value) == "Invalid IPv6 address: '[fe80::1%é]'"
 
 
 @pytest.mark.parametrize("host", ["[::ffff:192.168.0.1]", "::ffff:192.168.0.1"])

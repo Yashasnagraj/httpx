@@ -13,6 +13,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* `NO_PROXY` now supports IPv4/IPv6 CIDR ranges, bracketed IPv6 literals and `*.example.com` entries.
+* `DigestAuth` supports the `SHA-512-256` and `SHA-512-256-SESS` algorithms.
+* `HTTPTransport`/`AsyncHTTPTransport` pass `retries`, `local_address`, `uds` and `socket_options` through to proxy connection pools.
+* Python 3.14 added to the CI matrix and classifiers; Windows and macOS CI jobs.
+
+### Fixed
+
+* Redirects and auth retries no longer send an empty body with a stale `Content-Length` for `BytesIO`/iterator request bodies.
+* `Content-Length` for partially-read file objects now reflects the remaining bytes; non-regular files use chunked encoding.
+* Multi-member gzip responses are fully decoded; truncated gzip/deflate bodies raise `DecodingError`; zstd streaming across chunk boundaries works.
+* `response.history` is correct when an auth retry follows a redirect, and is populated before response event hooks run.
+* `base_url` containing a query string is merged correctly.
+* User-supplied `mounts` take priority over environment proxy settings.
+* Client-level `params` no longer overwrite a query embedded in the request URL.
+* Method-rewriting redirects strip `Content-Type` along with the body.
+* Mounted transports are closed even if the main transport's `close()` raises.
+* `NO_PROXY` values such as `[::1]` or `fd00::/8` no longer make `Client()` raise.
+* `create_ssl_context(verify=<str>, cert=...)` applies the client certificate.
+* `Timeout` misuse raises `ValueError` instead of `AssertionError`; `Proxy(auth=...)` takes precedence over URL userinfo.
+* `DigestAuth` challenge parsing is RFC 7616/7235 tolerant, per-origin, and escapes quoted values.
+* `import httpx` no longer imports the CLI dependencies eagerly.
+* URL fixes: punycode decoding of any label and invalid punycode no longer raise; uppercase schemes normalise default ports; port range validation; IPv6 `netloc=`; `copy_with(username=)` keeps the password; trailing `.`/`..` segments keep the trailing slash; `QueryParams` hash/equality consistency.
+* `WSGITransport` follows PEP 3333 for chunked bodies, `PATH_INFO`, `write()`, `close()` and latin-1 headers.
+* `ASGITransport` reports incomplete responses clearly and fills in default server ports.
+* `MockTransport` responses have `elapsed` set.
+* CLI handles non-ASCII headers, unknown text MIME types, missing optional dependencies and conflicting body options.
+* Multipart: text-mode file detection on Windows, user header dict no longer mutated, `Content-Type` boundary always matches the body.
+* `Headers.__eq__`/`__len__`, `iter_bytes(chunk_size=...)` validation, `Link` header parsing, bytes values in `data=`, callable `default_encoding` before read.
 
 ## 0.28.1 (6th December, 2024)
 

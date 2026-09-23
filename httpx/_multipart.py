@@ -56,7 +56,7 @@ def _guess_content_type(filename: str | None) -> str | None:
 def get_multipart_boundary_from_content_type(
     content_type: bytes | None,
 ) -> bytes | None:
-    if not content_type or not content_type.startswith(b"multipart/form-data"):
+    if not content_type or not content_type.lower().startswith(b"multipart/form-data"):
         return None
     # parse boundary according to
     # https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
@@ -65,6 +65,20 @@ def get_multipart_boundary_from_content_type(
             if section.strip().lower().startswith(b"boundary="):
                 return section.strip()[len(b"boundary=") :].strip(b'"')
     return None
+
+
+def is_text_mode_file(fileobj: typing.Any) -> bool:
+    """
+    Return `True` if `fileobj` is a file-like object opened in text mode.
+
+    Besides `io.TextIOBase` this also inspects the `mode` attribute, since
+    wrappers such as `tempfile._TemporaryFileWrapper` (the type returned by
+    `tempfile.TemporaryFile` on Windows) are not `io.TextIOBase` instances.
+    """
+    if isinstance(fileobj, io.TextIOBase):
+        return True
+    mode = getattr(fileobj, "mode", None)
+    return isinstance(mode, str) and "b" not in mode
 
 
 class DataField:
@@ -141,6 +155,8 @@ class FileField:
             else:
                 # all 4 parameters included
                 filename, fileobj, content_type, headers = value  # type: ignore
+                # Copy, so that we never mutate the caller's dictionary.
+                headers = dict(headers)
         else:
             filename = Path(str(getattr(value, "name", "upload"))).name
             fileobj = value
@@ -148,7 +164,7 @@ class FileField:
         if content_type is None:
             content_type = _guess_content_type(filename)
 
-        has_content_type_header = any("content-type" in key.lower() for key in headers)
+        has_content_type_header = any(key.lower() == "content-type" for key in headers)
         if content_type is not None and not has_content_type_header:
             # note that unlike requests, we ignore the content_type provided in the 3rd
             # tuple element if it is also included in the headers requests does
@@ -159,7 +175,7 @@ class FileField:
             raise TypeError(
                 "Multipart file uploads require 'io.BytesIO', not 'io.StringIO'."
             )
-        if isinstance(fileobj, io.TextIOBase):
+        if is_text_mode_file(fileobj):
             raise TypeError(
                 "Multipart file uploads must be opened in binary mode, not text mode."
             )

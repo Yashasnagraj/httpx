@@ -232,9 +232,12 @@ class BaseClient:
         return self._trust_env
 
     def _enforce_trailing_slash(self, url: URL) -> URL:
-        if url.raw_path.endswith(b"/"):
+        # Only the path component is considered here, so that any query
+        # string on the URL is left intact.
+        raw_path, separator, query = url.raw_path.partition(b"?")
+        if raw_path.endswith(b"/"):
             return url
-        return url.copy_with(raw_path=url.raw_path + b"/")
+        return url.copy_with(raw_path=raw_path + b"/" + separator + query)
 
     def _get_proxy_map(
         self, proxy: ProxyTypes | None, allow_env_proxies: bool
@@ -366,7 +369,7 @@ class BaseClient:
         url = self._merge_url(url)
         headers = self._merge_headers(headers)
         cookies = self._merge_cookies(cookies)
-        params = self._merge_queryparams(params)
+        params = self._merge_queryparams(params, url)
         extensions = {} if extensions is None else extensions
         if "timeout" not in extensions:
             timeout = (
@@ -406,8 +409,17 @@ class BaseClient:
             # URL('https://www.example.com/subpath/')
             # >>> client.build_request("GET", "/path").url
             # URL('https://www.example.com/subpath/path')
-            merge_raw_path = self.base_url.raw_path + merge_url.raw_path.lstrip(b"/")
-            return self.base_url.copy_with(raw_path=merge_raw_path)
+            #
+            # Only the path component of the base URL is used as the prefix.
+            # Any query string on the base URL is merged underneath the query
+            # string of the relative URL, so that the request URL wins on conflict.
+            base_raw_path, _, _ = self.base_url.raw_path.partition(b"?")
+            merge_raw_path = base_raw_path + merge_url.raw_path.lstrip(b"/")
+            merged_url = self.base_url.copy_with(raw_path=merge_raw_path)
+            if self.base_url.query:
+                merged_params = self.base_url.params.merge(merged_url.params)
+                merged_url = merged_url.copy_with(params=merged_params)
+            return merged_url
         return merge_url
 
     def _merge_cookies(self, cookies: CookieTypes | None = None) -> CookieTypes | None:
@@ -431,16 +443,23 @@ class BaseClient:
         return merged_headers
 
     def _merge_queryparams(
-        self, params: QueryParamTypes | None = None
+        self, params: QueryParamTypes | None = None, url: URL | None = None
     ) -> QueryParamTypes | None:
         """
         Merge a queryparams argument together with any queryparams on the client,
         to create the queryparams used for the outgoing request.
+
+        Client-level params have the lowest precedence, and sit underneath any
+        query string that is already embedded in the request URL. Explicitly
+        passed request-level params replace the URL query string, in the same
+        way as they do for `httpx.Request`.
         """
-        if params or self.params:
-            merged_queryparams = QueryParams(self.params)
-            return merged_queryparams.merge(params)
-        return params
+        if params is None:
+            if not self.params:
+                return None
+            url_params = None if url is None else url.params
+            return QueryParams(self.params).merge(url_params)
+        return QueryParams(self.params).merge(params)
 
     def _build_auth(self, auth: AuthTypes | None) -> Auth | None:
         if auth is None:
@@ -530,7 +549,10 @@ class BaseClient:
         # Handle malformed 'Location' headers that are "absolute" form, have no host.
         # See: https://github.com/encode/httpx/issues/771
         if url.scheme and not url.host:
-            url = url.copy_with(host=request.url.host)
+            # Copy the port as well as the host, so that a request to a
+            # non-default port is not redirected to the default port.
+            port = request.url.port if url.port is None else url.port
+            url = url.copy_with(host=request.url.host, port=port)
 
         # Facilitate relative 'Location' headers, as allowed by RFC 7231.
         # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
@@ -562,6 +584,7 @@ class BaseClient:
             # If we've switch to a 'GET' request, then strip any headers which
             # are only relevant to the request body.
             headers.pop("Content-Length", None)
+            headers.pop("Content-Type", None)
             headers.pop("Transfer-Encoding", None)
 
         # We should use the client cookie store to determine any cookie header,
@@ -694,7 +717,7 @@ class Client(BaseClient):
             limits=limits,
             transport=transport,
         )
-        self._mounts: dict[URLPattern, BaseTransport | None] = {
+        proxy_mounts: dict[URLPattern, BaseTransport | None] = {
             URLPattern(key): None
             if proxy is None
             else self._init_proxy_transport(
@@ -708,12 +731,22 @@ class Client(BaseClient):
             )
             for key, proxy in proxy_map.items()
         }
+        user_mounts: dict[URLPattern, BaseTransport | None] = {}
         if mounts is not None:
-            self._mounts.update(
-                {URLPattern(key): transport for key, transport in mounts.items()}
-            )
+            user_mounts = {
+                URLPattern(key): transport for key, transport in mounts.items()
+            }
+            # User-supplied mounts take priority over any proxy mounts
+            # derived from the environment or the `proxy` argument.
+            proxy_mounts = {
+                pattern: transport
+                for pattern, transport in proxy_mounts.items()
+                if pattern not in user_mounts
+            }
 
-        self._mounts = dict(sorted(self._mounts.items()))
+        self._mounts: dict[URLPattern, BaseTransport | None] = dict(
+            sorted(user_mounts.items()) + sorted(proxy_mounts.items())
+        )
 
     def _init_transport(
         self,
@@ -950,10 +983,11 @@ class Client(BaseClient):
                     except StopIteration:
                         return response
 
-                    response.history = list(history)
                     response.read()
                     request = next_request
-                    history.append(response)
+                    # Continue from the history of the response we just received,
+                    # so that any redirects it followed are preserved in order.
+                    history = response.history + [response]
 
                 except BaseException as exc:
                     response.close()
@@ -978,9 +1012,12 @@ class Client(BaseClient):
 
             response = self._send_single_request(request)
             try:
+                # Populate the history before running any response hooks,
+                # so that hooks can see the redirect chain.
+                response.history = list(history)
+
                 for hook in self._event_hooks["response"]:
                     hook(response)
-                response.history = list(history)
 
                 if not response.has_redirect_location:
                     return response
@@ -1069,7 +1106,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1098,7 +1135,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1131,7 +1168,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1168,7 +1205,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1205,7 +1242,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1238,7 +1275,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1267,10 +1304,25 @@ class Client(BaseClient):
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            self._transport.close()
-            for transport in self._mounts.values():
-                if transport is not None:
-                    transport.close()
+            # Ensure every mounted transport is closed, even if closing
+            # an earlier one raises. The first exception propagates.
+            transports = [self._transport] + [
+                transport
+                for transport in self._mounts.values()
+                if transport is not None
+            ]
+            self._close_transports(transports)
+
+    def _close_transports(self, transports: list[BaseTransport]) -> None:
+        first_exc: BaseException | None = None
+        for transport in transports:
+            try:
+                transport.close()
+            except BaseException as exc:
+                if first_exc is None:
+                    first_exc = exc
+        if first_exc is not None:
+            raise first_exc
 
     def __enter__(self: T) -> T:
         if self._state != ClientState.UNOPENED:
@@ -1409,7 +1461,7 @@ class AsyncClient(BaseClient):
             transport=transport,
         )
 
-        self._mounts: dict[URLPattern, AsyncBaseTransport | None] = {
+        proxy_mounts: dict[URLPattern, AsyncBaseTransport | None] = {
             URLPattern(key): None
             if proxy is None
             else self._init_proxy_transport(
@@ -1423,11 +1475,22 @@ class AsyncClient(BaseClient):
             )
             for key, proxy in proxy_map.items()
         }
+        user_mounts: dict[URLPattern, AsyncBaseTransport | None] = {}
         if mounts is not None:
-            self._mounts.update(
-                {URLPattern(key): transport for key, transport in mounts.items()}
-            )
-        self._mounts = dict(sorted(self._mounts.items()))
+            user_mounts = {
+                URLPattern(key): transport for key, transport in mounts.items()
+            }
+            # User-supplied mounts take priority over any proxy mounts
+            # derived from the environment or the `proxy` argument.
+            proxy_mounts = {
+                pattern: transport
+                for pattern, transport in proxy_mounts.items()
+                if pattern not in user_mounts
+            }
+
+        self._mounts: dict[URLPattern, AsyncBaseTransport | None] = dict(
+            sorted(user_mounts.items()) + sorted(proxy_mounts.items())
+        )
 
     def _init_transport(
         self,
@@ -1665,10 +1728,11 @@ class AsyncClient(BaseClient):
                     except StopAsyncIteration:
                         return response
 
-                    response.history = list(history)
                     await response.aread()
                     request = next_request
-                    history.append(response)
+                    # Continue from the history of the response we just received,
+                    # so that any redirects it followed are preserved in order.
+                    history = response.history + [response]
 
                 except BaseException as exc:
                     await response.aclose()
@@ -1693,10 +1757,12 @@ class AsyncClient(BaseClient):
 
             response = await self._send_single_request(request)
             try:
+                # Populate the history before running any response hooks,
+                # so that hooks can see the redirect chain.
+                response.history = list(history)
+
                 for hook in self._event_hooks["response"]:
                     await hook(response)
-
-                response.history = list(history)
 
                 if not response.has_redirect_location:
                     return response
@@ -1784,7 +1850,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1813,7 +1879,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1846,7 +1912,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1883,7 +1949,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1920,7 +1986,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1953,7 +2019,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
-        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
@@ -1982,10 +2048,25 @@ class AsyncClient(BaseClient):
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            await self._transport.aclose()
-            for proxy in self._mounts.values():
-                if proxy is not None:
-                    await proxy.aclose()
+            # Ensure every mounted transport is closed, even if closing
+            # an earlier one raises. The first exception propagates.
+            transports = [self._transport] + [
+                transport
+                for transport in self._mounts.values()
+                if transport is not None
+            ]
+            await self._aclose_transports(transports)
+
+    async def _aclose_transports(self, transports: list[AsyncBaseTransport]) -> None:
+        first_exc: BaseException | None = None
+        for transport in transports:
+            try:
+                await transport.aclose()
+            except BaseException as exc:
+                if first_exc is None:
+                    first_exc = exc
+        if first_exc is not None:
+            raise first_exc
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:

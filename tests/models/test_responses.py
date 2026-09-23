@@ -874,6 +874,17 @@ def test_json_with_specified_charset(encoding):
                 "self": {"url": "/resource", "rel": "self"},
             },
         ),
+        (
+            # A ';' inside the URL, and an '=' inside a quoted parameter value.
+            {"Link": '<https://example.com/?a=1;b=2>; rel="next"; title="x=y"'},
+            {
+                "next": {
+                    "url": "https://example.com/?a=1;b=2",
+                    "rel": "next",
+                    "title": "x=y",
+                }
+            },
+        ),
     ],
 )
 def test_link_headers(headers, expected):
@@ -1038,3 +1049,73 @@ def test_response_decode_text_using_explicit_encoding():
     assert response.reason_phrase == "OK"
     assert response.encoding == "cp1252"
     assert response.text == text
+
+
+def test_explicit_transfer_encoding_header_with_bytes_content():
+    headers = {"Transfer-Encoding": "chunked"}
+    response = httpx.Response(200, content=b"Hello, world!", headers=headers)
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+    assert response.content == b"Hello, world!"
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_iter_methods_reject_non_positive_chunk_size(chunk_size):
+    response = httpx.Response(200, content=b"Hello, world!")
+    with pytest.raises(ValueError):
+        list(response.iter_bytes(chunk_size=chunk_size))
+    with pytest.raises(ValueError):
+        list(response.iter_text(chunk_size=chunk_size))
+
+    response = httpx.Response(200, content=streaming_body())
+    with pytest.raises(ValueError):
+        list(response.iter_raw(chunk_size=chunk_size))
+    with pytest.raises(ValueError):
+        list(response.iter_bytes(chunk_size=chunk_size))
+    with pytest.raises(ValueError):
+        list(response.iter_text(chunk_size=chunk_size))
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+@pytest.mark.anyio
+async def test_aiter_methods_reject_non_positive_chunk_size(chunk_size):
+    response = httpx.Response(200, content=b"Hello, world!")
+    with pytest.raises(ValueError):
+        [part async for part in response.aiter_bytes(chunk_size=chunk_size)]
+    with pytest.raises(ValueError):
+        [part async for part in response.aiter_text(chunk_size=chunk_size)]
+
+    response = httpx.Response(200, content=async_streaming_body())
+    with pytest.raises(ValueError):
+        [part async for part in response.aiter_raw(chunk_size=chunk_size)]
+    with pytest.raises(ValueError):
+        [part async for part in response.aiter_bytes(chunk_size=chunk_size)]
+    with pytest.raises(ValueError):
+        [part async for part in response.aiter_text(chunk_size=chunk_size)]
+
+
+def test_response_streaming_autodetect_encoding_not_cached_before_read():
+    """
+    Accessing `.encoding` before the body is available must not permanently
+    pin a callable `default_encoding` to the utf-8 fallback.
+    """
+    text = "Non-seulement Despréaux ne se trompait pas, mais de tous les écrivains"
+    content = text.encode("ISO-8859-1")
+
+    def body() -> typing.Iterator[bytes]:
+        yield content
+
+    response = httpx.Response(200, content=body(), default_encoding=autodetect)
+    # No body yet, so autodetection cannot run. Fall back to utf-8 for now.
+    assert response.encoding == "utf-8"
+
+    response.read()
+    assert response.encoding in ("ISO-8859-1", "WINDOWS-1252")
+    assert response.text == text
+
+
+def test_response_streaming_iter_text_uses_utf8_fallback():
+    def body() -> typing.Iterator[bytes]:
+        yield b"Hello, world!"
+
+    response = httpx.Response(200, content=body(), default_encoding=autodetect)
+    assert "".join(response.iter_text()) == "Hello, world!"
