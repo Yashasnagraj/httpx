@@ -42,20 +42,22 @@ def create_ssl_context(
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    elif isinstance(verify, str):  # pragma: nocover
+    elif isinstance(verify, str):
         message = (
             "`verify=<str>` is deprecated. "
             "Use `verify=ssl.create_default_context(cafile=...)` "
             "or `verify=ssl.create_default_context(capath=...)` instead."
         )
         warnings.warn(message, DeprecationWarning)
+        # Don't return early here: `cert` still needs to be applied below.
         if os.path.isdir(verify):
-            return ssl.create_default_context(capath=verify)
-        return ssl.create_default_context(cafile=verify)
+            ctx = ssl.create_default_context(capath=verify)
+        else:
+            ctx = ssl.create_default_context(cafile=verify)
     else:
         ctx = verify
 
-    if cert:  # pragma: nocover
+    if cert:
         message = (
             "`cert=...` is deprecated. Use `verify=<ssl_context>` instead,"
             "with `.load_cert_chain()` to configure the certificate chain."
@@ -94,16 +96,26 @@ class Timeout:
     ) -> None:
         if isinstance(timeout, Timeout):
             # Passed as a single explicit Timeout.
-            assert connect is UNSET
-            assert read is UNSET
-            assert write is UNSET
-            assert pool is UNSET
+            if not all(
+                isinstance(value, UnsetType) for value in (connect, read, write, pool)
+            ):
+                raise ValueError(
+                    "httpx.Timeout cannot combine an existing Timeout instance "
+                    "with 'connect', 'read', 'write' or 'pool' overrides. "
+                    "Use httpx.Timeout(<default>, connect=..., ...) instead."
+                )
             self.connect = timeout.connect  # type: typing.Optional[float]
             self.read = timeout.read  # type: typing.Optional[float]
             self.write = timeout.write  # type: typing.Optional[float]
             self.pool = timeout.pool  # type: typing.Optional[float]
         elif isinstance(timeout, tuple):
             # Passed as a tuple.
+            if not 2 <= len(timeout) <= 4:
+                raise ValueError(
+                    "httpx.Timeout tuples must have between 2 and 4 items: "
+                    "(connect, read[, write[, pool]]). "
+                    f"Got a tuple of length {len(timeout)}."
+                )
             self.connect = timeout[0]
             self.read = timeout[1]
             self.write = None if len(timeout) < 3 else timeout[2]
@@ -199,6 +211,20 @@ class Limits:
 
 
 class Proxy:
+    """
+    Proxy configuration.
+
+    **Parameters:**
+
+    * **url** - The proxy URL. Any credentials in the URL's userinfo
+            (`http://user:pass@proxy.example.com`) are stripped from the URL
+            and used as the proxy authentication.
+    * **auth** - An explicit `(username, password)` pair. When given, this takes
+            precedence over any credentials embedded in the URL.
+    * **headers** - Additional headers to send to the proxy.
+    * **ssl_context** - The SSL context to use when connecting to an HTTPS proxy.
+    """
+
     def __init__(
         self,
         url: URL | str,
@@ -214,8 +240,10 @@ class Proxy:
             raise ValueError(f"Unknown scheme for proxy URL {url!r}")
 
         if url.username or url.password:
-            # Remove any auth credentials from the URL.
-            auth = (url.username, url.password)
+            # Remove any auth credentials from the URL. An explicit `auth=`
+            # argument takes precedence over credentials embedded in the URL.
+            if auth is None:
+                auth = (url.username, url.password)
             url = url.copy_with(username=None, password=None)
 
         self.url = url

@@ -198,6 +198,8 @@ def test_obfuscate_sensitive_headers(headers, output):
             [{"url": "http:/.../front.jpeg", "rel": "front", "type": "image/jpeg"}],
         ),
         ("<http:/.../front.jpeg>", [{"url": "http:/.../front.jpeg"}]),
+        # Tolerate a missing '<...>' wrapper.
+        ("http:/.../front.jpeg", [{"url": "http:/.../front.jpeg"}]),
         ("<http:/.../front.jpeg>;", [{"url": "http:/.../front.jpeg"}]),
         (
             '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;',
@@ -205,6 +207,10 @@ def test_obfuscate_sensitive_headers(headers, output):
                 {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
                 {"url": "http://.../back.jpeg"},
             ],
+        ),
+        (
+            '<http://example.com/?a=1;b=2>; rel=next; title="a=b"',
+            [{"url": "http://example.com/?a=1;b=2", "rel": "next", "title": "a=b"}],
         ),
         ("", []),
     ),
@@ -217,3 +223,24 @@ def test_parse_header_links(value, expected):
 def test_parse_header_links_no_link():
     all_links = httpx.Response(200).links
     assert all_links == {}
+
+
+def test_headers_len_counts_unique_keys():
+    h = httpx.Headers([("a", "123"), ("a", "456"), ("b", "789")])
+    assert len(h) == 2
+    assert len(h) == len(list(h)) == len(h.keys())
+    assert len(httpx.Headers()) == 0
+
+
+def test_headers_eq_with_non_header_types():
+    h = httpx.Headers({"a": "123"})
+    assert not (h == None)  # noqa: E711
+    assert h != None  # noqa: E711
+    assert not (h == 123)
+    assert h != 123
+    assert not (h == object())
+    # Sequences and mappings that cannot be coerced into headers.
+    assert h != [1, 2]
+    assert h != {"a": 123}
+    assert h != "a: 123"
+    assert not (httpx.Headers() == None)  # noqa: E711

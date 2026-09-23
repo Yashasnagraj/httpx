@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, unquote, urlencode
 
 import idna
 
+from ._exceptions import InvalidURL
 from ._types import QueryParamTypes
 from ._urlparse import urlparse
 from ._utils import primitive_value_to_str
@@ -116,6 +117,12 @@ class URL:
         if isinstance(url, str):
             self._uri_reference = urlparse(url, **kwargs)
         elif isinstance(url, URL):
+            if ("username" in kwargs) != ("password" in kwargs):
+                # Only one of "username" or "password" is being changed.
+                # Default the other from the existing URL so that it is
+                # preserved rather than silently dropped.
+                kwargs.setdefault("username", url.username)
+                kwargs.setdefault("password", url.password)
             self._uri_reference = url._uri_reference.copy_with(**kwargs)
         else:
             raise TypeError(
@@ -187,8 +194,13 @@ class URL:
         """
         host: str = self._uri_reference.host
 
-        if host.startswith("xn--"):
-            host = idna.decode(host)
+        if any(label.startswith("xn--") for label in host.split(".")):
+            try:
+                host = idna.decode(host)
+            except idna.IDNAError:
+                # Not a valid IDNA encoding, eg. "xn--zzzzzz.com".
+                # Fall back to the raw host rather than raising.
+                pass
 
         return host
 
@@ -369,7 +381,13 @@ class URL:
         return hash(str(self))
 
     def __eq__(self, other: typing.Any) -> bool:
-        return isinstance(other, (URL, str)) and str(self) == str(URL(other))
+        if not isinstance(other, (URL, str)):
+            return False
+        try:
+            return str(self) == str(URL(other))
+        except InvalidURL:
+            # A string that cannot be parsed as a URL is never equal.
+            return False
 
     def __str__(self) -> str:
         return str(self._uri_reference)
@@ -613,7 +631,8 @@ class QueryParams(typing.Mapping[str, str]):
         return bool(self._dict)
 
     def __hash__(self) -> int:
-        return hash(str(self))
+        # Must be consistent with `__eq__`, which is order-insensitive.
+        return hash(tuple(sorted(self.multi_items())))
 
     def __eq__(self, other: typing.Any) -> bool:
         if not isinstance(other, self.__class__):

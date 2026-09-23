@@ -101,16 +101,36 @@ def print_help() -> None:
 
 
 def get_lexer_for_response(response: Response) -> str:
+    """
+    Return the name of the pygments lexer to display the response body with,
+    or an empty string if the body should be treated as binary data.
+    """
     content_type = response.headers.get("Content-Type")
     if content_type is not None:
         mime_type, _, _ = content_type.partition(";")
+        mime_type = mime_type.strip().lower()
         try:
             return typing.cast(
-                str, pygments.lexers.get_lexer_for_mimetype(mime_type.strip()).name
+                str, pygments.lexers.get_lexer_for_mimetype(mime_type).name
             )
-        except pygments.util.ClassNotFound:  # pragma: no cover
+        except pygments.util.ClassNotFound:
             pass
-    return ""  # pragma: no cover
+        # Fall back to a sensible lexer for textual types that pygments does
+        # not know about, eg. "text/csv" or "application/problem+json".
+        if mime_type.endswith("+json"):
+            return "json"
+        if mime_type.endswith("+xml"):
+            return "xml"
+        if mime_type.startswith("text/"):
+            return "text"
+        return ""
+
+    # No Content-Type header. Display the body as text if it is valid UTF-8.
+    try:
+        response.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    return "text"
 
 
 def format_request_headers(request: httpcore.Request, http2: bool = False) -> str:
@@ -119,9 +139,10 @@ def format_request_headers(request: httpcore.Request, http2: bool = False) -> st
         (name.lower() if http2 else name, value) for name, value in request.headers
     ]
     method = request.method.decode("ascii")
-    target = request.url.target.decode("ascii")
+    target = request.url.target.decode("latin-1")
     lines = [f"{method} {target} {version}"] + [
-        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+        f"{name.decode('latin-1')}: {value.decode('latin-1')}"
+        for name, value in headers
     ]
     return "\n".join(lines)
 
@@ -136,10 +157,11 @@ def format_response_headers(
     reason = (
         codes.get_reason_phrase(status)
         if reason_phrase is None
-        else reason_phrase.decode("ascii")
+        else reason_phrase.decode("latin-1")
     )
     lines = [f"{version} {status} {reason}"] + [
-        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+        f"{name.decode('latin-1')}: {value.decode('latin-1')}"
+        for name, value in headers
     ]
     return "\n".join(lines)
 
@@ -174,8 +196,8 @@ def print_response(response: Response) -> None:
         if lexer_name.lower() == "json":
             try:
                 data = response.json()
-                text = json.dumps(data, indent=4)
-            except ValueError:  # pragma: no cover
+                text = json.dumps(data, indent=4, ensure_ascii=False)
+            except ValueError:
                 text = response.text
         else:
             text = response.text
@@ -472,8 +494,30 @@ def main(
     An HTTP command line client.
     Sends a request and displays the response.
     """
+    body_options = [
+        name
+        for name, value in (
+            ("--content", content),
+            ("--data", data),
+            ("--files", files),
+            ("--json", json),
+        )
+        if value
+    ]
+    if len(body_options) > 1:
+        raise click.UsageError(
+            "Only one of --content, --data, --files or --json may be given, "
+            f"got {' and '.join(body_options)}."
+        )
+
     if not method:
-        method = "POST" if content or data or files or json else "GET"
+        method = "POST" if body_options else "GET"
+
+    # Repeated `--data NAME VALUE` options with the same name are sent as
+    # multiple values, rather than the last one overwriting the others.
+    form_data: dict[str, list[str]] = {}
+    for name, value in data:
+        form_data.setdefault(name, []).append(value)
 
     try:
         with Client(proxy=proxy, timeout=timeout, http2=http2, verify=verify) as client:
@@ -482,7 +526,7 @@ def main(
                 url,
                 params=list(params),
                 content=content,
-                data=dict(data),
+                data=form_data,
                 files=files,  # type: ignore
                 json=json,
                 headers=headers,
@@ -498,9 +542,13 @@ def main(
                     if response.content:
                         print_response(response)
 
-    except RequestError as exc:
+    except (RequestError, ImportError, ValueError, UnicodeError) as exc:
+        # `UnicodeError` is a `ValueError` subclass, listed for clarity: it is
+        # raised when a `--headers` value cannot be encoded for the wire.
         console = rich.console.Console()
-        console.print(f"[red]{type(exc).__name__}[/red]: {exc}")
+        console.print(
+            f"[red]{type(exc).__name__}[/red]: {rich.markup.escape(str(exc))}"
+        )
         sys.exit(1)
 
     sys.exit(0 if response.is_success else 1)

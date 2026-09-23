@@ -5,10 +5,17 @@ on:
     tags:
       - '*'
 
+permissions:
+  # Required by `mkdocs gh-deploy` to push to the gh-pages branch.
+  contents: write
+  # Required for PyPI trusted publishing (OIDC).
+  id-token: write
+
 jobs:
   publish:
     name: "Publish release"
     runs-on: "ubuntu-latest"
+    timeout-minutes: 30
 
     environment:
        name: deploy
@@ -17,13 +24,19 @@ jobs:
       - uses: "actions/checkout@v4"
       - uses: "actions/setup-python@v6"
         with:
-          python-version: 3.9
+          python-version: "3.12"
       - name: "Install dependencies"
         run: "scripts/install"
       - name: "Build package & docs"
         run: "scripts/build"
-      - name: "Publish to PyPI & deploy docs"
+      - name: "Check package version matches tag"
+        run: |
+          VERSION=$(grep __version__ httpx/__version__.py | grep -o '[0-9][^"]*')
+          if [ "refs/tags/${VERSION}" != "${GITHUB_REF}" ]; then
+            echo "GitHub Ref '${GITHUB_REF}' did not match package version '${VERSION}'"
+            exit 1
+          fi
+      - name: "Publish to PyPI"
+        uses: "pypa/gh-action-pypi-publish@release/v1"
+      - name: "Deploy docs"
         run: "scripts/publish"
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}

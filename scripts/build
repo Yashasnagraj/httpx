@@ -1,7 +1,9 @@
 #!/bin/sh -e
 
-if [ -d 'venv' ] ; then
+if [ -d 'venv/bin' ] ; then
     PREFIX="venv/bin/"
+elif [ -d 'venv/Scripts' ] ; then
+    PREFIX="venv/Scripts/"
 else
     PREFIX=""
 fi

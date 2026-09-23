@@ -263,3 +263,29 @@ def test_proxy_with_mounts():
 
     transport = client._transport_for_url(httpx.URL("http://example.com"))
     assert transport == proxy_transport
+
+
+@pytest.mark.parametrize("client_class", [httpx.Client, httpx.AsyncClient])
+def test_user_mounts_take_priority_over_environment_proxies(monkeypatch, client_class):
+    # An explicit `mounts={...}` should take priority over any proxies that are
+    # configured via the environment, even if the environment proxy pattern
+    # is more specific.
+    monkeypatch.setenv("HTTP_PROXY", "http://localhost:123")
+    monkeypatch.setenv("HTTPS_PROXY", "http://localhost:123")
+
+    mounted = httpx.MockTransport(lambda request: httpx.Response(200))
+    client = client_class(mounts={"all://": mounted})
+
+    assert client._transport_for_url(httpx.URL("http://example.com")) is mounted
+    assert client._transport_for_url(httpx.URL("https://example.com")) is mounted
+
+
+def test_user_mounts_override_matching_environment_proxy(monkeypatch):
+    # A user mount with the same pattern as an environment proxy replaces it.
+    monkeypatch.setenv("HTTP_PROXY", "http://localhost:123")
+
+    mounted = httpx.MockTransport(lambda request: httpx.Response(200))
+    client = httpx.Client(mounts={"http://": mounted})
+
+    assert list(client._mounts.values()) == [mounted]
+    assert client._transport_for_url(httpx.URL("http://example.com")) is mounted

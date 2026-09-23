@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import io
 import typing
 import zlib
@@ -9,6 +10,7 @@ import pytest
 import zstandard as zstd
 
 import httpx
+from httpx._decoders import ByteChunker, TextChunker
 
 
 def test_deflate():
@@ -353,3 +355,107 @@ def test_invalid_content_encoding_header():
         content=body,
     )
     assert response.content == body
+
+
+def test_gzip_multi_member():
+    """
+    A gzip body may consist of several concatenated members (RFC 1952, 2.2).
+    """
+    compressed_body = gzip.compress(b"a") + gzip.compress(b"b")
+
+    headers = [(b"Content-Encoding", b"gzip")]
+    response = httpx.Response(200, headers=headers, content=compressed_body)
+    assert response.content == b"ab"
+
+
+def test_gzip_multi_member_streaming():
+    first = gzip.compress(b"hello ")
+    second = gzip.compress(b"world")
+    # Split so that one chunk ends exactly on a member boundary, and another
+    # straddles it.
+    chunks = [first[:5], first[5:], second[:3], second[3:]]
+
+    headers = [(b"Content-Encoding", b"gzip")]
+    response = httpx.Response(200, headers=headers, content=iter(chunks))
+    assert response.read() == b"hello world"
+
+    chunks = [first[:5], first[5:] + second[:3], second[3:]]
+    response = httpx.Response(200, headers=headers, content=iter(chunks))
+    assert response.read() == b"hello world"
+
+
+def test_gzip_truncated():
+    compressed_body = gzip.compress(b"test 123")
+
+    headers = [(b"Content-Encoding", b"gzip")]
+    with pytest.raises(httpx.DecodingError, match="incomplete"):
+        httpx.Response(200, headers=headers, content=compressed_body[:-4])
+
+
+@pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, -zlib.MAX_WBITS])
+def test_deflate_truncated(wbits):
+    compressor = zlib.compressobj(9, zlib.DEFLATED, wbits)
+    compressed_body = compressor.compress(b"test 123" * 10) + compressor.flush()
+
+    headers = [(b"Content-Encoding", b"deflate")]
+    with pytest.raises(httpx.DecodingError, match="incomplete"):
+        httpx.Response(200, headers=headers, content=compressed_body[:-4])
+
+
+@pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, -zlib.MAX_WBITS])
+def test_deflate_streaming_single_byte_chunks(wbits):
+    """
+    zlib can only reject a stream as "not zlib-wrapped" once it has seen the
+    two header bytes, so the raw-deflate fallback must still work when the
+    first chunk is shorter than that.
+    """
+    body = b"test 123"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, wbits)
+    compressed_body = compressor.compress(body) + compressor.flush()
+    chunks = [compressed_body[i : i + 1] for i in range(len(compressed_body))]
+
+    headers = [(b"Content-Encoding", b"deflate")]
+    response = httpx.Response(200, headers=headers, content=iter(chunks))
+    assert response.read() == body
+
+
+def test_deflate_single_byte_body_is_incomplete():
+    headers = [(b"Content-Encoding", b"deflate")]
+    with pytest.raises(httpx.DecodingError, match="incomplete"):
+        httpx.Response(200, headers=headers, content=b"K")
+
+
+def test_zstd_streaming_chunks():
+    # See https://github.com/encode/httpx/issues/3697
+    data = zstd.ZstdCompressor().compress(b"a" * 100000)
+    chunks = [data[:10], data[10:50], data[50:]]
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=iter(chunks))
+    assert response.read() == b"a" * 100000
+
+
+def test_zstd_multiframe_separate_chunks():
+    chunks = [zstd.compress(b"hello "), zstd.compress(b"world")]
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=iter(chunks))
+    assert response.read() == b"hello world"
+
+    # ...and as a single body.
+    response = httpx.Response(200, headers=headers, content=b"".join(chunks))
+    assert response.content == b"hello world"
+
+
+def test_multi_with_zstd_empty_content():
+    headers = [(b"Content-Encoding", b"gzip, zstd")]
+    response = httpx.Response(200, headers=headers, content=b"")
+    assert response.content == b""
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_chunkers_reject_non_positive_chunk_size(chunk_size):
+    with pytest.raises(ValueError):
+        ByteChunker(chunk_size=chunk_size)
+    with pytest.raises(ValueError):
+        TextChunker(chunk_size=chunk_size)

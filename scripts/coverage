@@ -1,8 +1,10 @@
 #!/bin/sh -e
 
 export PREFIX=""
-if [ -d 'venv' ] ; then
+if [ -d 'venv/bin' ] ; then
     export PREFIX="venv/bin/"
+elif [ -d 'venv/Scripts' ] ; then
+    export PREFIX="venv/Scripts/"
 fi
 export SOURCE_FILES="httpx tests"
 

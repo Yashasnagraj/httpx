@@ -2,8 +2,10 @@
 
 VERSION_FILE="httpx/__version__.py"
 
-if [ -d 'venv' ] ; then
+if [ -d 'venv/bin' ] ; then
     PREFIX="venv/bin/"
+elif [ -d 'venv/Scripts' ] ; then
+    PREFIX="venv/Scripts/"
 else
     PREFIX=""
 fi
@@ -22,5 +24,9 @@ fi
 
 set -x
 
-${PREFIX}twine upload dist/*
+# In GitHub Actions the package is uploaded via PyPI trusted publishing
+# (see .github/workflows/publish.yml), so only upload with twine locally.
+if [ -z "$GITHUB_ACTIONS" ]; then
+  ${PREFIX}twine upload dist/*
+fi
 ${PREFIX}mkdocs gh-deploy --force

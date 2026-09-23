@@ -33,6 +33,13 @@ except ImportError:  # pragma: no cover
     zstandard = None  # type: ignore
 
 
+def _validate_chunk_size(chunk_size: int | None) -> None:
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError(
+            f"'chunk_size' must be a positive integer or None, got {chunk_size!r}."
+        )
+
+
 class ContentDecoder:
     def decode(self, data: bytes) -> bytes:
         raise NotImplementedError()  # pragma: no cover
@@ -63,23 +70,43 @@ class DeflateDecoder(ContentDecoder):
     def __init__(self) -> None:
         self.first_attempt = True
         self.decompressor = zlib.decompressobj()
+        self.seen_data = False
+        # zlib can only reject a stream as "not zlib-wrapped" once it has seen
+        # the two header bytes, so we buffer input until then before deciding
+        # whether to fall back to raw deflate.
+        self._buffer = b""
 
     def decode(self, data: bytes) -> bytes:
-        was_first_attempt = self.first_attempt
-        self.first_attempt = False
+        if not data:
+            return b""
+        if self.first_attempt:
+            self._buffer += data
+            if len(self._buffer) < 2:
+                return b""
+            data, self._buffer = self._buffer, b""
+            self.first_attempt = False
+            try:
+                return self._decompress(data)
+            except DecodingError:
+                # Not a zlib-wrapped stream. Retry as raw deflate.
+                self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+        return self._decompress(data)
+
+    def _decompress(self, data: bytes) -> bytes:
+        self.seen_data = True
         try:
             return self.decompressor.decompress(data)
         except zlib.error as exc:
-            if was_first_attempt:
-                self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
-                return self.decode(data)
             raise DecodingError(str(exc)) from exc
 
     def flush(self) -> bytes:
         try:
-            return self.decompressor.flush()
+            data = self.decompressor.flush()
         except zlib.error as exc:  # pragma: no cover
             raise DecodingError(str(exc)) from exc
+        if (self.seen_data or self._buffer) and not self.decompressor.eof:
+            raise DecodingError("Deflate data is incomplete")
+        return data
 
 
 class GZipDecoder(ContentDecoder):
@@ -91,18 +118,34 @@ class GZipDecoder(ContentDecoder):
 
     def __init__(self) -> None:
         self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        self.seen_data = False
 
     def decode(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        self.seen_data = True
+        output = io.BytesIO()
         try:
-            return self.decompressor.decompress(data)
+            output.write(self.decompressor.decompress(data))
+            # A gzip body may consist of multiple concatenated members
+            # (RFC 1952, section 2.2). Once one member is complete, start
+            # a fresh decompressor on whatever data follows it.
+            while self.decompressor.eof and self.decompressor.unused_data:
+                unused_data = self.decompressor.unused_data
+                self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                output.write(self.decompressor.decompress(unused_data))
         except zlib.error as exc:
             raise DecodingError(str(exc)) from exc
+        return output.getvalue()
 
     def flush(self) -> bytes:
         try:
-            return self.decompressor.flush()
+            data = self.decompressor.flush()
         except zlib.error as exc:  # pragma: no cover
             raise DecodingError(str(exc)) from exc
+        if self.seen_data and not self.decompressor.eof:
+            raise DecodingError("GZip data is incomplete")
+        return data
 
 
 class BrotliDecoder(ContentDecoder):
@@ -179,7 +222,14 @@ class ZStandardDecoder(ContentDecoder):
 
     def decode(self, data: bytes) -> bytes:
         assert zstandard is not None
+        if not data:
+            return b""
         self.seen_data = True
+        if self.decompressor.eof:
+            # The previous frame completed exactly at a chunk boundary.
+            # A decompressobj cannot be reused, so start a fresh one for
+            # the next frame.
+            self.decompressor = zstandard.ZstdDecompressor().decompressobj()
         output = io.BytesIO()
         try:
             output.write(self.decompressor.decompress(data))
@@ -231,6 +281,7 @@ class ByteChunker:
     """
 
     def __init__(self, chunk_size: int | None = None) -> None:
+        _validate_chunk_size(chunk_size)
         self._buffer = io.BytesIO()
         self._chunk_size = chunk_size
 
@@ -270,6 +321,7 @@ class TextChunker:
     """
 
     def __init__(self, chunk_size: int | None = None) -> None:
+        _validate_chunk_size(chunk_size)
         self._buffer = io.StringIO()
         self._chunk_size = chunk_size
 

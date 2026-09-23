@@ -7,7 +7,7 @@ import json as jsonlib
 import re
 import typing
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from http.cookiejar import Cookie, CookieJar
 
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
@@ -20,6 +20,7 @@ from ._decoders import (
     MultiDecoder,
     TextChunker,
     TextDecoder,
+    _validate_chunk_size,
 )
 from ._exceptions import (
     CookieConflict,
@@ -30,7 +31,7 @@ from ._exceptions import (
     StreamConsumed,
     request_context,
 )
-from ._multipart import get_multipart_boundary_from_content_type
+from ._multipart import MultipartStream, get_multipart_boundary_from_content_type
 from ._status_codes import codes
 from ._types import (
     AsyncByteStream,
@@ -112,14 +113,17 @@ def _parse_header_links(value: str) -> list[dict[str, str]]:
     if not value:
         return links
     for val in re.split(", *<", value):
+        # Split on the closing '>' rather than ';', since the URL itself
+        # may legitimately contain a ';'.
         try:
-            url, params = val.split(";", 1)
+            url, params = val.split(">", 1)
         except ValueError:
             url, params = val, ""
         link = {"url": url.strip("<> '\"")}
-        for param in params.split(";"):
+        for param in params.lstrip(" ;").split(";"):
             try:
-                key, value = param.split("=")
+                # A quoted parameter value may itself contain '='.
+                key, value = param.split("=", 1)
             except ValueError:
                 break
             link[key.strip(replace_chars)] = value.strip(replace_chars)
@@ -351,12 +355,15 @@ class Headers(typing.MutableMapping[str, str]):
         return iter(self.keys())
 
     def __len__(self) -> int:
-        return len(self._list)
+        # Consistent with `__iter__`, which yields each unique key once.
+        return len(self.keys())
 
     def __eq__(self, other: typing.Any) -> bool:
+        if not isinstance(other, (Headers, Mapping, Sequence)):
+            return NotImplemented
         try:
             other_headers = Headers(other)
-        except ValueError:
+        except (TypeError, ValueError):
             return False
 
         self_list = [(key, value) for _, key, value in self._list]
@@ -405,17 +412,28 @@ class Request:
 
         if stream is None:
             content_type: str | None = self.headers.get("content-type")
+            boundary = get_multipart_boundary_from_content_type(
+                content_type=content_type.encode(self.headers.encoding)
+                if content_type
+                else None
+            )
             headers, stream = encode_request(
                 content=content,
                 data=data,
                 files=files,
                 json=json,
-                boundary=get_multipart_boundary_from_content_type(
-                    content_type=content_type.encode(self.headers.encoding)
-                    if content_type
-                    else None
-                ),
+                boundary=boundary,
             )
+            if (
+                isinstance(stream, MultipartStream)
+                and content_type is not None
+                and boundary is None
+            ):
+                # The user supplied a Content-Type that does not carry the
+                # boundary actually used in the multipart body (or is not
+                # multipart at all). Such a header would make the body
+                # unparseable, so replace it with the real one.
+                self.headers["Content-Type"] = stream.content_type
             self._prepare(headers)
             self.stream = stream
             # Load the request body, except for streaming content.
@@ -442,6 +460,10 @@ class Request:
         for key, value in default_headers.items():
             # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
             if key.lower() == "transfer-encoding" and "Content-Length" in self.headers:
+                continue
+            # Ignore Content-Length if Transfer-Encoding has been set explicitly.
+            # A message must not carry both. See RFC 9112, section 6.1.
+            if key.lower() == "content-length" and "Transfer-Encoding" in self.headers:
                 continue
             self.headers.setdefault(key, value)
 
@@ -573,6 +595,10 @@ class Response:
             # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
             if key.lower() == "transfer-encoding" and "content-length" in self.headers:
                 continue
+            # Ignore Content-Length if Transfer-Encoding has been set explicitly.
+            # A message must not carry both. See RFC 9112, section 6.1.
+            if key.lower() == "content-length" and "transfer-encoding" in self.headers:
+                continue
             self.headers.setdefault(key, value)
 
     @property
@@ -668,6 +694,12 @@ class Response:
                     encoding = self.default_encoding
                 elif hasattr(self, "_content"):
                     encoding = self.default_encoding(self._content)
+                else:
+                    # A callable `default_encoding` needs the body, which is
+                    # not available yet. Fall back to utf-8 for this access
+                    # only, without caching, so that autodetection can still
+                    # run once the response has been read.
+                    return "utf-8"
             self._encoding = encoding or "utf-8"
         return self._encoding
 
@@ -886,6 +918,7 @@ class Response:
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
         """
+        _validate_chunk_size(chunk_size)
         if hasattr(self, "_content"):
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
@@ -910,6 +943,7 @@ class Response:
         that handles both gzip, deflate, etc but also detects the content's
         string encoding.
         """
+        _validate_chunk_size(chunk_size)
         decoder = TextDecoder(encoding=self.encoding or "utf-8")
         chunker = TextChunker(chunk_size=chunk_size)
         with request_context(request=self._request):
@@ -936,6 +970,7 @@ class Response:
         """
         A byte-iterator over the raw response content.
         """
+        _validate_chunk_size(chunk_size)
         if self.is_stream_consumed:
             raise StreamConsumed()
         if self.is_closed:
@@ -986,6 +1021,7 @@ class Response:
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
         """
+        _validate_chunk_size(chunk_size)
         if hasattr(self, "_content"):
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
@@ -1012,6 +1048,7 @@ class Response:
         that handles both gzip, deflate, etc but also detects the content's
         string encoding.
         """
+        _validate_chunk_size(chunk_size)
         decoder = TextDecoder(encoding=self.encoding or "utf-8")
         chunker = TextChunker(chunk_size=chunk_size)
         with request_context(request=self._request):
@@ -1040,6 +1077,7 @@ class Response:
         """
         A byte-iterator over the raw response content.
         """
+        _validate_chunk_size(chunk_size)
         if self.is_stream_consumed:
             raise StreamConsumed()
         if self.is_closed:

@@ -239,3 +239,19 @@ def test_request_params():
 
     request = httpx.Request("GET", "http://example.com?a=1", params={})
     assert str(request.url) == "http://example.com"
+
+
+def test_explicit_transfer_encoding_header_with_bytes_content():
+    """
+    A message must not include both `Transfer-Encoding` and `Content-Length`.
+    See RFC 9112, section 6.1.
+    """
+    headers = {"Transfer-Encoding": "chunked"}
+    request = httpx.Request(
+        "POST", "http://example.org", content=b"test 123", headers=headers
+    )
+    assert request.headers == {
+        "Host": "example.org",
+        "Transfer-Encoding": "chunked",
+    }
+    assert request.content == b"test 123"

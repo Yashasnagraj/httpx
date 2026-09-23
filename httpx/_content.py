@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import inspect
+import collections.abc
 import warnings
 from json import dumps as json_dumps
 from typing import (
@@ -14,7 +14,7 @@ from typing import (
 from urllib.parse import urlencode
 
 from ._exceptions import StreamClosed, StreamConsumed
-from ._multipart import MultipartStream
+from ._multipart import MultipartStream, is_text_mode_file
 from ._types import (
     AsyncByteStream,
     RequestContent,
@@ -45,19 +45,35 @@ class IteratorByteStream(SyncByteStream):
     def __init__(self, stream: Iterable[bytes]) -> None:
         self._stream = stream
         self._is_stream_consumed = False
-        self._is_generator = inspect.isgenerator(stream)
+        self._is_filelike = hasattr(stream, "read")
+        # Any single-use iterator (generators included) cannot be replayed.
+        # File-like objects are handled separately, since they are also
+        # iterators but can be rewound.
+        self._is_iterator = not self._is_filelike and isinstance(
+            stream, collections.abc.Iterator
+        )
+        # For seekable file-like objects, remember where we started so that
+        # the body can be replayed, e.g. on a redirect or an auth retry.
+        self._start_offset: int | None = None
+        if self._is_filelike and hasattr(stream, "seek") and hasattr(stream, "tell"):
+            try:
+                self._start_offset = stream.tell()
+            except OSError:
+                self._start_offset = None
 
     def __iter__(self) -> Iterator[bytes]:
-        if self._is_stream_consumed and self._is_generator:
+        if self._is_stream_consumed and self._is_iterator:
             raise StreamConsumed()
 
         self._is_stream_consumed = True
-        if hasattr(self._stream, "read"):
+        if self._is_filelike:
             # File-like interfaces should use 'read' directly.
-            chunk = self._stream.read(self.CHUNK_SIZE)
+            if self._start_offset is not None:
+                self._stream.seek(self._start_offset)  # type: ignore[attr-defined]
+            chunk = self._stream.read(self.CHUNK_SIZE)  # type: ignore[attr-defined]
             while chunk:
                 yield chunk
-                chunk = self._stream.read(self.CHUNK_SIZE)
+                chunk = self._stream.read(self.CHUNK_SIZE)  # type: ignore[attr-defined]
         else:
             # Otherwise iterate.
             for part in self._stream:
@@ -70,10 +86,14 @@ class AsyncIteratorByteStream(AsyncByteStream):
     def __init__(self, stream: AsyncIterable[bytes]) -> None:
         self._stream = stream
         self._is_stream_consumed = False
-        self._is_generator = inspect.isasyncgen(stream)
+        # Any single-use async iterator (async generators included) cannot
+        # be replayed.
+        self._is_iterator = not hasattr(stream, "aread") and isinstance(
+            stream, collections.abc.AsyncIterator
+        )
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        if self._is_stream_consumed and self._is_generator:
+        if self._is_stream_consumed and self._is_iterator:
             raise StreamConsumed()
 
         self._is_stream_consumed = True
@@ -107,18 +127,26 @@ class UnattachedStream(AsyncByteStream, SyncByteStream):
 def encode_content(
     content: str | bytes | Iterable[bytes] | AsyncIterable[bytes],
 ) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
-    if isinstance(content, (bytes, str)):
-        body = content.encode("utf-8") if isinstance(content, str) else content
+    if isinstance(content, (bytes, bytearray, memoryview, str)):
+        body = content.encode("utf-8") if isinstance(content, str) else bytes(content)
         content_length = len(body)
         headers = {"Content-Length": str(content_length)} if body else {}
         return headers, ByteStream(body)
+
+    elif is_text_mode_file(content):
+        raise TypeError(
+            "Streaming request content from a file requires the file to be "
+            "opened in binary mode, not text mode."
+        )
 
     elif isinstance(content, Iterable) and not isinstance(content, dict):
         # `not isinstance(content, dict)` is a bit oddly specific, but it
         # catches a case that's easy for users to make in error, and would
         # otherwise pass through here, like any other bytes-iterable,
         # because `dict` happens to be iterable. See issue #2491.
-        content_length_or_none = peek_filelike_length(content)
+        content_length_or_none = peek_filelike_length(
+            content, from_current_position=True
+        )
 
         if content_length_or_none is None:
             headers = {"Transfer-Encoding": "chunked"}
@@ -133,15 +161,25 @@ def encode_content(
     raise TypeError(f"Unexpected type for 'content', {type(content)!r}")
 
 
+def _urlencoded_value(value: Any) -> str | bytes:
+    """
+    Coerce a form value for `urlencode`. Bytes are passed through untouched
+    so that they are percent-encoded as-is, rather than via their `repr()`.
+    """
+    if isinstance(value, bytes):
+        return value
+    return primitive_value_to_str(value)
+
+
 def encode_urlencoded_data(
     data: RequestData,
 ) -> tuple[dict[str, str], ByteStream]:
-    plain_data = []
+    plain_data: list[tuple[str, str | bytes]] = []
     for key, value in data.items():
         if isinstance(value, (list, tuple)):
-            plain_data.extend([(key, primitive_value_to_str(item)) for item in value])
+            plain_data.extend([(key, _urlencoded_value(item)) for item in value])
         else:
-            plain_data.append((key, primitive_value_to_str(value)))
+            plain_data.append((key, _urlencoded_value(value)))
     body = urlencode(plain_data, doseq=True).encode("utf-8")
     content_length = str(len(body))
     content_type = "application/x-www-form-urlencoded"

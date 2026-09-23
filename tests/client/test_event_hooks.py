@@ -226,3 +226,44 @@ async def test_async_event_hooks_with_redirect():
             "headers": {"server": "testserver"},
         },
     ]
+
+
+def test_response_event_hook_sees_history():
+    """
+    Response event hooks should see the redirect history of the response.
+    """
+    history_lengths = []
+
+    def on_response(response):
+        history_lengths.append(len(response.history))
+
+    with httpx.Client(
+        event_hooks={"response": [on_response]},
+        transport=httpx.MockTransport(app),
+        follow_redirects=True,
+    ) as http:
+        response = http.get("http://127.0.0.1:8000/redirect")
+
+    assert len(response.history) == 1
+    assert history_lengths == [0, 1]
+
+
+@pytest.mark.anyio
+async def test_async_response_event_hook_sees_history():
+    """
+    Response event hooks should see the redirect history of the response.
+    """
+    history_lengths = []
+
+    async def on_response(response):
+        history_lengths.append(len(response.history))
+
+    async with httpx.AsyncClient(
+        event_hooks={"response": [on_response]},
+        transport=httpx.MockTransport(app),
+        follow_redirects=True,
+    ) as http:
+        response = await http.get("http://127.0.0.1:8000/redirect")
+
+    assert len(response.history) == 1
+    assert history_lengths == [0, 1]

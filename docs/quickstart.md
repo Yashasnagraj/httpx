@@ -2,7 +2,7 @@
 
 HTTPX is a Python library for making HTTP requests. It supports synchronous and asynchronous requests, making it useful for interacting with web services and APIs.
 
-## 1. Making Your First Request
+## Making Your First Request
 
 First, import HTTPX:
 
@@ -21,7 +21,7 @@ print(response.json())       # Response data
 
 A `200` status code indicates that the request was successful.
 
-## 2. Making Different HTTP Requests
+## Making Different HTTP Requests
 
 HTTPX provides convenient functions for common HTTP methods.
 
@@ -51,7 +51,7 @@ httpx.head("https://httpbin.org/get")
 httpx.options("https://httpbin.org/get")
 ```
 
-## 3. Passing Query Parameters
+## Passing Query Parameters
 
 Use the `params` argument to add query parameters to a URL. HTTPX automatically encodes them.
 
@@ -86,14 +86,33 @@ print(response.url)
 
 The resulting URL contains both values as repeated query parameters.
 
-## 4. Reading Response Content
+## Reading Response Content
 
 HTTPX provides several ways to access a response body.
 
 ### Text
 
+HTTPX will automatically handle decoding the response content into Unicode text.
+
 ```python
 response = httpx.get("https://www.example.org")
+
+print(response.text)
+```
+
+You can inspect what encoding will be used to decode the response:
+
+```python
+print(response.encoding)  # 'UTF-8'
+```
+
+In some cases the response may not contain an explicit encoding, in which case
+`response.encoding` is `None` and HTTPX will attempt to automatically determine
+an encoding to use. If you need to override the standard behaviour and
+explicitly set the encoding, do so before accessing `.text`:
+
+```python
+response.encoding = "ISO-8859-1"
 
 print(response.text)
 ```
@@ -120,7 +139,12 @@ print(content)
 
 Binary content is useful when working with images, documents, and other non-text responses.
 
-## 5. Setting Custom Headers
+Any `gzip` and `deflate` HTTP response encodings will automatically be decoded
+for you. If `brotli` is installed, then the `brotli` response encoding will be
+supported. If `zstandard` is installed, then `zstd` response encodings will
+also be supported.
+
+## Setting Custom Headers
 
 Headers allow you to send additional information with a request.
 
@@ -137,7 +161,7 @@ response = httpx.get(
 print(response.json())
 ```
 
-## 6. Sending Data
+## Sending Data
 
 HTTPX supports form data, JSON, and raw binary content.
 
@@ -183,7 +207,7 @@ response = httpx.post(
 
 Use `data=` for form submissions, `json=` for JSON payloads, and `content=` for raw bytes.
 
-## 7. Uploading Files
+## Sending Multipart File Uploads
 
 HTTPX supports multipart file uploads.
 
@@ -197,6 +221,20 @@ with open("report.txt", "rb") as file:
 print(response.status_code)
 ```
 
+You can also explicitly set the filename and content type, by using a tuple
+of items for the file value:
+
+```python
+with open("report.xls", "rb") as file:
+    files = {
+        "upload-file": ("report.xls", file, "application/vnd.ms-excel")
+    }
+    response = httpx.post(
+        "https://httpbin.org/post",
+        files=files
+    )
+```
+
 You can also include regular form fields alongside uploaded files:
 
 ```python
@@ -208,7 +246,7 @@ with open("report.txt", "rb") as file:
     )
 ```
 
-## 8. Handling Response Status Codes
+## Handling Response Status Codes
 
 You can inspect the status code or raise an exception when a request returns an unsuccessful HTTP status.
 
@@ -218,6 +256,12 @@ response = httpx.get(
 )
 
 print(response.status_code)  # 404
+```
+
+HTTPX also includes an easy shortcut for accessing status codes by their text phrase:
+
+```python
+print(response.status_code == httpx.codes.NOT_FOUND)  # True
 ```
 
 Use `raise_for_status()` to handle unsuccessful responses:
@@ -230,7 +274,11 @@ response = httpx.get(
 response.raise_for_status()
 ```
 
-This raises an `HTTPStatusError` for a 4xx or 5xx response.
+This raises an `HTTPStatusError` for any response that is not a 2xx success
+code. That includes 4xx client errors and 5xx server errors, but also 1xx
+informational responses and 3xx redirects. In particular, because HTTPX does
+not follow redirects by default, a 3xx response will raise unless you pass
+`follow_redirects=True` (see [Following Redirects](#following-redirects)).
 
 For successful responses, the method returns the response object, allowing method chaining:
 
@@ -240,7 +288,7 @@ data = httpx.get(
 ).raise_for_status().json()
 ```
 
-## 9. Accessing Response Headers
+## Accessing Response Headers
 
 Response headers provide information about the server's response.
 
@@ -255,7 +303,9 @@ print(response.headers.get("content-type"))
 
 Header names are case-insensitive, so `Content-Type` and `content-type` refer to the same header.
 
-## 10. Streaming Large Responses
+Multiple values for a single response header are represented as a single comma-separated value, as per [RFC 7230](https://tools.ietf.org/html/rfc7230#section-3.2).
+
+## Streaming Responses
 
 For large downloads, streaming lets you process the response incrementally instead of loading the entire body into memory.
 
@@ -281,9 +331,27 @@ with httpx.stream(
         print(line)
 ```
 
+HTTPX will use universal line endings, normalising all cases to `\n`.
+
 Use `iter_raw()` when you need the raw response bytes without HTTP content decoding.
 
-## 11. Working with Cookies
+If you're using streaming responses in any of these ways then the
+`response.content` and `response.text` attributes will not be available, and
+will raise errors if accessed. However you can also use the response streaming
+functionality to conditionally load the response body, by calling
+`response.read()` first:
+
+```python
+with httpx.stream(
+    "GET",
+    "https://www.example.com"
+) as response:
+    if int(response.headers["Content-Length"]) < TOO_LONG:
+        response.read()
+        print(response.text)
+```
+
+## Working with Cookies
 
 Cookies can be read from responses or sent with requests.
 
@@ -310,9 +378,21 @@ response = httpx.get(
 print(response.json())
 ```
 
-## 12. Following Redirects
+## Following Redirects
 
-HTTPX does not follow redirects by default.
+HTTPX does not follow redirects by default. When a redirect response is
+returned, the `next_request` property holds the request that would be sent
+next if redirects were being followed:
+
+```python
+response = httpx.get("http://github.com")
+
+print(response.status_code)   # 301
+print(response.history)       # []
+print(response.next_request)  # <Request('GET', 'https://github.com/')>
+```
+
+You can enable redirect handling with the `follow_redirects` parameter:
 
 ```python
 response = httpx.get(
@@ -326,7 +406,7 @@ print(response.history)
 
 The `history` property contains the redirect responses followed before reaching the final response.
 
-## 13. Configuring Timeouts
+## Timeouts
 
 HTTPX uses a default network inactivity timeout of five seconds.
 
@@ -349,8 +429,9 @@ response = httpx.get(
 ```
 
 For production applications, configure timeouts according to the needs of your service.
+For advanced timeout management, see [Timeout fine-tuning](advanced/timeouts.md#fine-tuning-the-configuration).
 
-## 14. Authentication
+## Authentication
 
 HTTPX supports Basic and Digest authentication.
 
@@ -379,11 +460,15 @@ response = httpx.get(
 
 Use real credentials only with trusted services and secure HTTPS connections.
 
-## 15. Handling Exceptions
+## Exceptions
 
 HTTPX provides exceptions that help you handle request failures.
 
 ### Request errors
+
+The `RequestError` class is a superclass that encompasses any exception that
+occurs while issuing an HTTP request. These exceptions include a `.request`
+attribute.
 
 ```python
 try:
@@ -391,10 +476,14 @@ try:
         "https://www.example.com"
     )
 except httpx.RequestError as exc:
-    print(f"Request failed: {exc}")
+    print(f"An error occurred while requesting {exc.request.url!r}.")
 ```
 
 ### HTTP status errors
+
+The `HTTPStatusError` class is raised by `response.raise_for_status()` on
+responses which are not a 2xx success code. These exceptions include both a
+`.request` and a `.response` attribute.
 
 ```python
 try:
@@ -409,7 +498,10 @@ except httpx.HTTPStatusError as exc:
     )
 ```
 
-`RequestError` covers errors that occur while making a request, while `HTTPStatusError` is raised when `raise_for_status()` encounters an unsuccessful response.
+There is also a base class `HTTPError` that includes both of these categories,
+and can be used to catch either failed requests or unsuccessful responses.
+
+For a full list of available exceptions, see [Exceptions (API Reference)](exceptions.md).
 
 ---
 
@@ -428,4 +520,8 @@ except httpx.HTTPStatusError as exc:
 | Check response status | `raise_for_status()`    |
 | Stream a response     | `httpx.stream()`        |
 
-For more advanced usage, explore HTTPX's asynchronous client, connection pooling, and transport configuration.
+## Next Steps
+
+- [Async Support](async.md) for using HTTPX with `asyncio`, `trio` or `anyio`.
+- [Clients](advanced/clients.md) for connection pooling and sharing configuration across requests.
+- [Timeout fine-tuning](advanced/timeouts.md#fine-tuning-the-configuration) for per-phase timeout configuration.

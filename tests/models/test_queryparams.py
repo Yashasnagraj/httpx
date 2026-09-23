@@ -134,3 +134,21 @@ def test_queryparams_are_hashable():
     )
 
     assert len(set(params)) == 2
+
+
+def test_queryparams_hash_is_order_insensitive():
+    # `__eq__` is order-insensitive, so `__hash__` must be too.
+    a = httpx.QueryParams("a=123&b=456")
+    b = httpx.QueryParams("b=456&a=123")
+    assert a == b
+    assert hash(a) == hash(b)
+    assert len({a, b}) == 1
+
+    # Including for repeated keys.
+    c = httpx.QueryParams("a=1&b=2&a=3")
+    d = httpx.QueryParams("b=2&a=1&a=3")
+    assert c == d
+    assert hash(c) == hash(d)
+
+    # Unequal params hash differently.
+    assert hash(httpx.QueryParams("a=1")) != hash(httpx.QueryParams("a=2"))
