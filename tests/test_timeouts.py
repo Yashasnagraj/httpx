@@ -16,8 +16,8 @@ async def test_read_timeout(server):
 
 @pytest.mark.anyio
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="write timeouts are not reliably triggered on Windows loopback",
+    sys.platform != "linux",
+    reason="write timeouts are only reliably triggered on Linux loopback sockets",
 )
 async def test_write_timeout(server):
     timeout = httpx.Timeout(None, write=1e-6)

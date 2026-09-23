@@ -158,7 +158,7 @@ This fork was audited end to end (library code, CLI, transports, tests, docs, pa
 
 | Problem | Fix |
 | --- | --- |
-| The suite had 5 failures on Windows (text-mode multipart, write timeout, uvicorn access logs captured by `caplog`), and CI only ran on Linux. | The multipart bug is fixed, the write-timeout test is skipped on Windows, the logging tests filter to the `httpx` logger, and CI gained Windows and macOS jobs. |
+| The suite had 5 failures on Windows (text-mode multipart, write timeout, uvicorn access logs captured by `caplog`), and CI only ran on Linux. | The multipart bug is fixed, the write-timeout test is skipped on non-Linux platforms, the logging tests filter to the `httpx` logger, and CI gained Windows and macOS jobs. |
 | The rewritten quickstart renumbered its headings, which broke anchors linked from other docs and from library docstrings, said `raise_for_status()` only raises for 4xx/5xx, and dropped the encoding, streaming-read, `next_request` and exception-attribute material. | Stable heading slugs are restored, the statement is corrected, the content is back, and four other pre-existing broken anchors are fixed. `mkdocs build --strict` passes. |
 | Packaging and CI: no Python 3.14 classifier or CI leg, no `Typing :: Typed` classifier, the publish workflow used a long-lived PyPI token, no `permissions`/`concurrency`/`timeout-minutes`, scripts only knew `venv/bin`, and `chardet` was pinned to 5.2 although a test had been adapted for 6.0. | All updated; publishing uses PyPI trusted publishing. |
 

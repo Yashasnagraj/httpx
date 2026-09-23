@@ -6,7 +6,8 @@
 
 # Optional charset auto-detection
 # Used in our test cases
-chardet==6.0.0
+chardet==6.0.0; python_version >= "3.10"
+chardet==5.2.0; python_version < "3.10"
 
 # Documentation
 mkdocs==1.6.1
