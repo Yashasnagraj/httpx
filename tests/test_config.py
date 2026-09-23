@@ -20,10 +20,13 @@ def test_load_ssl_config_verify_non_existing_file():
         context.load_verify_locations(cafile="/path/to/nowhere")
 
 
-def test_load_ssl_with_keylog(monkeypatch: typing.Any) -> None:
-    monkeypatch.setenv("SSLKEYLOGFILE", "test")
+def test_load_ssl_with_keylog(monkeypatch: typing.Any, tmp_path: Path) -> None:
+    # Use a temporary path: OpenSSL creates the key log file as soon as the
+    # context is configured, so a relative name would litter the repository.
+    keylog_file = str(tmp_path / "keylog.txt")
+    monkeypatch.setenv("SSLKEYLOGFILE", keylog_file)
     context = httpx.create_ssl_context()
-    assert context.keylog_filename == "test"
+    assert context.keylog_filename == keylog_file
 
 
 def test_load_ssl_config_verify_existing_file():
