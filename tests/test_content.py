@@ -707,3 +707,17 @@ async def test_urlencoded_bytes():
     request = httpx.Request(method, url, data={"key": [b"a", "b", b"\xff"]})
     assert isinstance(request.stream, typing.Iterable)
     assert b"".join(list(request.stream)) == b"key=a&key=b&key=%FF"
+
+
+@pytest.mark.anyio
+async def test_bytestream_async_iterator_protocol():
+    """
+    `ByteStream.__aiter__` returns a real async iterator, not an async
+    generator, so it is safe to abandon part-way through.
+    """
+    stream = httpx.ByteStream(b"Hello, world!")
+    iterator = stream.__aiter__()
+    assert iterator.__aiter__() is iterator
+    assert await iterator.__anext__() == b"Hello, world!"
+    with pytest.raises(StopAsyncIteration):
+        await iterator.__anext__()

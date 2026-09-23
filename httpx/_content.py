@@ -35,8 +35,27 @@ class ByteStream(AsyncByteStream, SyncByteStream):
     def __iter__(self) -> Iterator[bytes]:
         yield self._stream
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
-        yield self._stream
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        # A plain async iterator rather than an async generator: an async
+        # generator that is abandoned part-way (for example when a write
+        # timeout interrupts sending the request body) is finalised by the
+        # event loop and triggers "async generator was garbage collected
+        # before it had been exhausted" warnings.
+        return _SingleChunkAsyncIterator(self._stream)
+
+
+class _SingleChunkAsyncIterator:
+    def __init__(self, chunk: bytes) -> None:
+        self._chunk: bytes | None = chunk
+
+    def __aiter__(self) -> _SingleChunkAsyncIterator:
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._chunk is None:
+            raise StopAsyncIteration
+        chunk, self._chunk = self._chunk, None
+        return chunk
 
 
 class IteratorByteStream(SyncByteStream):

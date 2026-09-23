@@ -272,7 +272,12 @@ def serve_in_thread(server: TestServer) -> typing.Iterator[TestServer]:
     thread = threading.Thread(target=server.run)
     thread.start()
     try:
+        deadline = time.monotonic() + 30
         while not server.started:
+            if not thread.is_alive():  # pragma: no cover
+                raise RuntimeError("The test server thread exited before starting.")
+            if time.monotonic() > deadline:  # pragma: no cover
+                raise RuntimeError("Timed out waiting for the test server to start.")
             time.sleep(1e-3)
         yield server
     finally:
