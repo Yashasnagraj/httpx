@@ -244,3 +244,48 @@ def test_headers_eq_with_non_header_types():
     assert h != {"a": 123}
     assert h != "a: 123"
     assert not (httpx.Headers() == None)  # noqa: E711
+
+
+def test_headers_update_after_read_redetects_encoding():
+    # Reading the headers caches the auto-detected encoding ("ascii" here).
+    # Adding non-ascii bytes afterwards must not leave a stale encoding behind.
+    h = httpx.Headers({"a": "b"})
+    assert h.encoding == "ascii"
+    h.update({b"x": "café".encode("utf-8")})
+    assert h["x"] == "café"
+    assert h.encoding == "utf-8"
+    assert dict(h) == {"a": "b", "x": "café"}
+
+    h = httpx.Headers({"a": "b"})
+    assert h["a"] == "b"
+    h.update([(b"x", "é".encode("iso-8859-1"))])
+    assert h["x"] == "é"
+    assert h.encoding == "iso-8859-1"
+
+
+def test_headers_setitem_after_read_redetects_encoding():
+    h = httpx.Headers({"a": "b"})
+    assert h.encoding == "ascii"
+    h["x"] = "café"
+    assert h["x"] == "café"
+    assert h.encoding == "utf-8"
+
+
+def test_headers_explicit_encoding_is_kept_on_mutation():
+    h = httpx.Headers({"a": "b"}, encoding="iso-8859-1")
+    h.update({b"x": "café".encode("utf-8")})
+    assert h.encoding == "iso-8859-1"
+    h.encoding = "utf-8"
+    h["y"] = "é"
+    assert h.encoding == "utf-8"
+    assert h["y"] == "é"
+    with pytest.raises(UnicodeEncodeError):
+        httpx.Headers(encoding="ascii")["x"] = "é"
+
+
+def test_headers_copy_keeps_encoding_auto_detected():
+    h = httpx.Headers({"a": "b"})
+    copied = h.copy()
+    copied.update({b"x": "café".encode("utf-8")})
+    assert copied["x"] == "café"
+    assert h.encoding == "ascii"

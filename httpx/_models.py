@@ -165,6 +165,10 @@ class Headers(typing.MutableMapping[str, str]):
                 bytes_value = _normalize_header_value(v, encoding)
                 self._list.append((bytes_key, bytes_key.lower(), bytes_value))
 
+        # `_explicit_encoding` is set by the caller and always respected.
+        # `_encoding` additionally caches an auto-detected encoding, which is
+        # invalidated whenever new raw header bytes are added.
+        self._explicit_encoding = encoding
         self._encoding = encoding
 
     @property
@@ -194,6 +198,7 @@ class Headers(typing.MutableMapping[str, str]):
 
     @encoding.setter
     def encoding(self, value: str) -> None:
+        self._explicit_encoding = value
         self._encoding = value
 
     @property
@@ -281,9 +286,11 @@ class Headers(typing.MutableMapping[str, str]):
             if key in self:
                 self.pop(key)
         self._list.extend(headers._list)
+        if self._explicit_encoding is None:
+            self._encoding = None
 
     def copy(self) -> Headers:
-        return Headers(self, encoding=self.encoding)
+        return Headers(self, encoding=self._explicit_encoding)
 
     def __getitem__(self, key: str) -> str:
         """
@@ -310,8 +317,18 @@ class Headers(typing.MutableMapping[str, str]):
         Set the header `key` to `value`, removing any duplicate entries.
         Retains insertion order.
         """
-        set_key = key.encode(self._encoding or "utf-8")
-        set_value = value.encode(self._encoding or "utf-8")
+        encoding = self._encoding or "utf-8"
+        try:
+            set_key = key.encode(encoding)
+            set_value = value.encode(encoding)
+        except UnicodeEncodeError:
+            if self._explicit_encoding is not None:
+                raise
+            # The cached encoding was only auto-detected, so fall back to
+            # utf-8 and re-detect the encoding on the next read.
+            set_key = key.encode("utf-8")
+            set_value = value.encode("utf-8")
+            self._encoding = None
         lookup_key = set_key.lower()
 
         found_indexes = [

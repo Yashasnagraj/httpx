@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 * `MockTransport` responses have `elapsed` set.
 * CLI handles non-ASCII headers, unknown text MIME types, missing optional dependencies and conflicting body options.
 * Multipart: text-mode file detection on Windows, user header dict no longer mutated, `Content-Type` boundary always matches the body.
+* `Headers` re-detects its encoding after `update()` or `__setitem__` add non-ASCII bytes, instead of raising `UnicodeDecodeError` on every later read.
 * `Headers.__eq__`/`__len__`, `iter_bytes(chunk_size=...)` validation, `Link` header parsing, bytes values in `data=`, callable `default_encoding` before read.
 
 ## 0.28.1 (6th December, 2024)
